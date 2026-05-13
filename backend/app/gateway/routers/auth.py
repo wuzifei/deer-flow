@@ -140,8 +140,8 @@ def _set_session_cookie(response: Response, token: str, request: Request) -> Non
         value=token,
         httponly=True,
         secure=is_https,
-        samesite="lax",
-        max_age=config.token_expiry_days * 24 * 3600 if is_https else None,
+        samesite="none" if is_https else "lax",
+        max_age=config.token_expiry_days * 24 * 3600,
     )
 
 
@@ -325,7 +325,7 @@ async def register(request: Request, response: Response, body: RegisterRequest):
 @router.post("/logout", response_model=MessageResponse)
 async def logout(request: Request, response: Response):
     """Logout current user by clearing the cookie."""
-    response.delete_cookie(key="access_token", secure=is_secure_request(request), samesite="lax")
+    response.delete_cookie(key="access_token", secure=is_secure_request(request), samesite="none" if is_secure_request(request) else "lax")
     return MessageResponse(message="Successfully logged out")
 
 
@@ -383,36 +383,13 @@ async def get_me(request: Request):
 
 
 _SETUP_STATUS_COOLDOWN: dict[str, float] = {}
-_SETUP_STATUS_COOLDOWN_SECONDS = 60
+_SETUP_STATUS_COOLDOWN_SECONDS = 1
 _MAX_TRACKED_SETUP_STATUS_IPS = 10000
 
 
 @router.get("/setup-status")
 async def setup_status(request: Request):
     """Check if an admin account exists. Returns needs_setup=True when no admin exists."""
-    client_ip = _get_client_ip(request)
-    now = time.time()
-    last_check = _SETUP_STATUS_COOLDOWN.get(client_ip, 0)
-    elapsed = now - last_check
-    if elapsed < _SETUP_STATUS_COOLDOWN_SECONDS:
-        retry_after = max(1, int(_SETUP_STATUS_COOLDOWN_SECONDS - elapsed))
-        raise HTTPException(
-            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-            detail="Setup status check is rate limited",
-            headers={"Retry-After": str(retry_after)},
-        )
-    # Evict stale entries when dict grows too large to bound memory usage.
-    if len(_SETUP_STATUS_COOLDOWN) >= _MAX_TRACKED_SETUP_STATUS_IPS:
-        cutoff = now - _SETUP_STATUS_COOLDOWN_SECONDS
-        stale = [k for k, t in _SETUP_STATUS_COOLDOWN.items() if t < cutoff]
-        for k in stale:
-            del _SETUP_STATUS_COOLDOWN[k]
-        # If still too large after evicting expired entries, remove oldest half.
-        if len(_SETUP_STATUS_COOLDOWN) >= _MAX_TRACKED_SETUP_STATUS_IPS:
-            by_time = sorted(_SETUP_STATUS_COOLDOWN.items(), key=lambda kv: kv[1])
-            for k, _ in by_time[: len(by_time) // 2]:
-                del _SETUP_STATUS_COOLDOWN[k]
-    _SETUP_STATUS_COOLDOWN[client_ip] = now
     admin_count = await get_local_provider().count_admin_users()
     return {"needs_setup": admin_count == 0}
 

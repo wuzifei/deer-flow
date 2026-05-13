@@ -103,6 +103,11 @@ def _configured_cors_origins() -> set[str]:
         normalized = _normalize_origin(origin)
         if normalized:
             origins.add(normalized)
+    # OPC integration: always allow the embedded iframe origin
+    for _o in ("https://ld22956fj32.vicp.fun", "http://localhost:62400"):
+        _n = _normalize_origin(_o)
+        if _n:
+            origins.add(_n)
     return origins
 
 
@@ -134,14 +139,26 @@ def _forwarded_param(request: Request, name: str) -> str | None:
 
 def _request_scheme(request: Request) -> str:
     """Resolve the original request scheme from trusted proxy headers."""
-    scheme = _forwarded_param(request, "proto") or _first_header_value(request.headers.get("x-forwarded-proto")) or request.url.scheme
-    return scheme.lower()
+    scheme = (
+        _forwarded_param(request, "proto")
+        or _first_header_value(request.headers.get("x-forwarded-proto"))
+    )
+    if scheme:
+        return scheme.lower()
+    # Check X-Forwarded-Origin (set by Next.js middleware proxy)
+    fwd_origin = request.headers.get("x-forwarded-origin", "").strip()
+    origin = request.headers.get("origin", "").strip()
+    if fwd_origin.startswith("https://"):
+        return "https"
+    if origin.startswith("https://"):
+        return "https"
+    return request.url.scheme.lower()
 
 
 def _request_origin(request: Request) -> str | None:
     """Build the origin for the URL the browser is targeting."""
     scheme = _request_scheme(request)
-    host = _forwarded_param(request, "host") or _first_header_value(request.headers.get("x-forwarded-host")) or request.headers.get("host") or request.url.netloc
+    host = _forwarded_param(request, "host") or _first_header_value(request.headers.get("x-forwarded-host")) or _first_header_value(request.headers.get("x-original-host")) or request.headers.get("host") or request.url.netloc
 
     forwarded_port = _first_header_value(request.headers.get("x-forwarded-port"))
     if forwarded_port and ":" not in host.rsplit("]", 1)[-1]:
@@ -206,15 +223,15 @@ class CSRFMiddleware(BaseHTTPMiddleware):
 
         # For auth endpoints that set up session, also set CSRF cookie
         if _is_auth and request.method == "POST":
-            # Generate a new CSRF token for the session
             csrf_token = generate_csrf_token()
             is_https = is_secure_request(request)
             response.set_cookie(
                 key=CSRF_COOKIE_NAME,
                 value=csrf_token,
-                httponly=False,  # Must be JS-readable for Double Submit Cookie pattern
+                httponly=False,
                 secure=is_https,
-                samesite="strict",
+                samesite="none" if is_https else "lax",
+                max_age=86400 * 7,
             )
 
         return response
