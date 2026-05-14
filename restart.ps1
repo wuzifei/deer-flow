@@ -3,7 +3,7 @@
 # Optional: -GatewayPort 8001 -FrontendPort 3000
 
 param(
-    [int]$GatewayPort  = 8001,
+    [int]$GatewayPort  = 8002,
     [int]$FrontendPort = 3000
 )
 

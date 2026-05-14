@@ -271,7 +271,7 @@ export function MessageList({
           if (group.type === "human" || group.type === "assistant") {
             return (
               <div
-                key={group.id}
+                key={`${groupIndex}:${group.id}`}
                 className={cn(
                   "w-full",
                   group.type === "assistant" && "group/assistant-turn",
@@ -300,7 +300,7 @@ export function MessageList({
             const message = group.messages[0];
             if (message && hasContent(message)) {
               return (
-                <div key={group.id} className="w-full">
+                <div key={`${groupIndex}:${group.id}`} className="w-full">
                   <MarkdownContent
                     content={extractContentFromMessage(message)}
                     isLoading={thread.isLoading}
@@ -323,7 +323,7 @@ export function MessageList({
               }
             }
             return (
-              <div className="w-full" key={group.id}>
+              <div className="w-full" key={`${groupIndex}:${group.id}`}>
                 {group.messages[0] && hasContent(group.messages[0]) && (
                   <MarkdownContent
                     content={extractContentFromMessage(group.messages[0])}
@@ -437,7 +437,7 @@ export function MessageList({
             }
             return (
               <div
-                key={"subtask-group-" + group.id}
+                key={`subtask-group-${groupIndex}:${group.id}`}
                 className="relative z-1 flex flex-col gap-2"
               >
                 {results}
@@ -450,7 +450,7 @@ export function MessageList({
             );
           }
           return (
-            <div key={"group-" + group.id} className="w-full">
+            <div key={`group-${groupIndex}:${group.id}`} className="w-full">
               <MessageGroup
                 messages={group.messages}
                 isLoading={thread.isLoading}

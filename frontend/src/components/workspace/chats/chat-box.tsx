@@ -1,4 +1,4 @@
-import { FilesIcon, XIcon } from "lucide-react";
+import { ArrowLeftIcon, FilesIcon, XIcon } from "lucide-react";
 import { usePathname } from "next/navigation";
 import { useEffect, useMemo, useRef, useState } from "react";
 import type { GroupImperativeHandle } from "react-resizable-panels";
@@ -11,6 +11,7 @@ import {
   ResizablePanelGroup,
 } from "@/components/ui/resizable";
 import { env } from "@/env";
+import { useIsMobile } from "@/hooks/use-mobile";
 import { cn } from "@/lib/utils";
 
 import {
@@ -31,6 +32,7 @@ const ChatBox: React.FC<{ children: React.ReactNode; threadId: string }> = ({
   const pathname = usePathname();
   const threadIdRef = useRef(threadId);
   const layoutRef = useRef<GroupImperativeHandle>(null);
+  const isMobile = useIsMobile();
 
   const {
     artifacts,
@@ -49,16 +51,7 @@ const ChatBox: React.FC<{ children: React.ReactNode; threadId: string }> = ({
       deselect();
     }
 
-    // Update artifacts from the current thread
     setArtifacts(thread.values.artifacts);
-
-    // DO NOT automatically deselect the artifact when switching threads, because the artifacts auto discovering is not work now.
-    // if (
-    //   selectedArtifact &&
-    //   !thread.values.artifacts?.includes(selectedArtifact)
-    // ) {
-    //   deselect();
-    // }
 
     if (
       env.NEXT_PUBLIC_STATIC_WEBSITE_ONLY === "true" &&
@@ -91,15 +84,82 @@ const ChatBox: React.FC<{ children: React.ReactNode; threadId: string }> = ({
   }, [pathname]);
 
   useEffect(() => {
-    if (layoutRef.current) {
+    if (layoutRef.current && !isMobile) {
       if (artifactPanelOpen) {
         layoutRef.current.setLayout(OPEN_MODE);
       } else {
         layoutRef.current.setLayout(CLOSE_MODE);
       }
     }
-  }, [artifactPanelOpen]);
+  }, [artifactPanelOpen, isMobile]);
 
+  // 移动端：文件查看使用全屏覆盖层
+  if (isMobile) {
+    return (
+      <div className="relative h-full">
+        {children}
+        {artifactPanelOpen && (
+          <div className="fixed inset-0 z-50 bg-background flex flex-col">
+            <div className="flex items-center gap-2 border-b px-3 py-2">
+              <Button
+                size="icon-sm"
+                variant="ghost"
+                onClick={() => setArtifactsOpen(false)}
+              >
+                <ArrowLeftIcon />
+              </Button>
+              <span className="text-sm font-medium truncate">
+                {selectedArtifact?.split("/").pop() ?? "Artifacts"}
+              </span>
+              <div className="ml-auto">
+                <Button
+                  size="icon-sm"
+                  variant="ghost"
+                  onClick={() => setArtifactsOpen(false)}
+                >
+                  <XIcon />
+                </Button>
+              </div>
+            </div>
+            <div className="flex-1 min-h-0 overflow-auto">
+              {selectedArtifact ? (
+                <ArtifactFileDetail
+                  className="size-full"
+                  filepath={selectedArtifact}
+                  threadId={threadId}
+                />
+              ) : (
+                <div className="flex size-full justify-center">
+                  {thread.values.artifacts?.length === 0 ? (
+                    <ConversationEmptyState
+                      icon={<FilesIcon />}
+                      title="No artifact selected"
+                      description="Select an artifact to view its details"
+                    />
+                  ) : (
+                    <div className="flex size-full max-w-(--container-width-sm) flex-col justify-center p-4">
+                      <header className="shrink-0">
+                        <h2 className="text-lg font-medium">Artifacts</h2>
+                      </header>
+                      <main className="min-h-0 grow">
+                        <ArtifactFileList
+                          className="max-w-(--container-width-sm) p-4"
+                          files={thread.values.artifacts ?? []}
+                          threadId={threadId}
+                        />
+                      </main>
+                    </div>
+                  )}
+                </div>
+              )}
+            </div>
+          </div>
+        )}
+      </div>
+    );
+  }
+
+  // 桌面端：原有的 ResizablePanelGroup 布局
   return (
     <ResizablePanelGroup
       id={`${resizableIdBase}-panels`}

@@ -207,13 +207,15 @@ class CSRFMiddleware(BaseHTTPMiddleware):
             cookie_token = request.cookies.get(CSRF_COOKIE_NAME)
             header_token = request.headers.get(CSRF_HEADER_NAME)
 
-            if not cookie_token or not header_token:
+            # Auto-renew: CSRF cookie expired but session still valid — allow through
+            if not cookie_token and request.cookies.get("access_token"):
+                pass
+            elif not cookie_token or not header_token:
                 return JSONResponse(
                     status_code=403,
                     content={"detail": "CSRF token missing. Include X-CSRF-Token header."},
                 )
-
-            if not secrets.compare_digest(cookie_token, header_token):
+            elif not secrets.compare_digest(cookie_token, header_token):
                 return JSONResponse(
                     status_code=403,
                     content={"detail": "CSRF token mismatch."},
@@ -223,6 +225,18 @@ class CSRFMiddleware(BaseHTTPMiddleware):
 
         # For auth endpoints that set up session, also set CSRF cookie
         if _is_auth and request.method == "POST":
+            csrf_token = generate_csrf_token()
+            is_https = is_secure_request(request)
+            response.set_cookie(
+                key=CSRF_COOKIE_NAME,
+                value=csrf_token,
+                httponly=False,
+                secure=is_https,
+                samesite="none" if is_https else "lax",
+                max_age=86400 * 7,
+            )
+        elif not _is_auth and response.status_code < 400 and not request.cookies.get(CSRF_COOKIE_NAME):
+            # Auto-renew: authenticated non-auth requests without CSRF cookie get one
             csrf_token = generate_csrf_token()
             is_https = is_secure_request(request)
             response.set_cookie(

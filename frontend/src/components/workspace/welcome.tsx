@@ -51,7 +51,7 @@ export function Welcome({
       {searchParams.get("mode") === "skill" ? (
         <div className="text-muted-foreground text-sm">
           {t.welcome.createYourOwnSkillDescription.includes("\n") ? (
-            <pre className="font-sans whitespace-pre">
+            <pre className="font-sans whitespace-pre-wrap">
               {t.welcome.createYourOwnSkillDescription}
             </pre>
           ) : (
@@ -61,7 +61,7 @@ export function Welcome({
       ) : (
         <div className="text-muted-foreground text-sm">
           {t.welcome.description.includes("\n") ? (
-            <pre className="font-sans whitespace-pre">
+            <pre className="font-sans whitespace-pre-wrap">
               {t.welcome.description}
             </pre>
           ) : (
