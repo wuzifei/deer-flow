@@ -114,12 +114,57 @@ class RunManager:
         """Return a run record by ID, or ``None``."""
         return self._runs.get(run_id)
 
+    def _record_from_dict(self, d: dict[str, Any]) -> RunRecord:
+        """Rehydrate a RunRecord from a store dict."""
+        return RunRecord(
+            run_id=d["run_id"],
+            thread_id=d["thread_id"],
+            assistant_id=d.get("assistant_id"),
+            status=RunStatus(d.get("status", "pending")),
+            on_disconnect=DisconnectMode(d.get("on_disconnect", "cancel")),
+            multitask_strategy=d.get("multitask_strategy", "reject"),
+            metadata=d.get("metadata") or {},
+            kwargs=d.get("kwargs") or {},
+            created_at=d.get("created_at", ""),
+            updated_at=d.get("updated_at", ""),
+            model_name=d.get("model_name"),
+            error=d.get("error"),
+        )
+
     async def list_by_thread(self, thread_id: str) -> list[RunRecord]:
-        """Return all runs for a given thread, newest first."""
+        """Return all runs for a given thread, newest first.
+
+        Falls back to the persistent store when the in-memory registry is empty
+        (e.g. after a gateway restart).
+        """
         async with self._lock:
-            # Dict insertion order matches creation order, so reversing it gives
-            # us deterministic newest-first results even when timestamps tie.
-            return [r for r in self._runs.values() if r.thread_id == thread_id]
+            memory_map = {
+                r.run_id: r for r in self._runs.values() if r.thread_id == thread_id
+            }
+
+        stored: list[dict[str, Any]] = []
+        if self._store is not None:
+            try:
+                stored = await self._store.list_by_thread(thread_id, limit=100)
+            except Exception:
+                logger.warning(
+                    "Failed to list runs from store for thread %s", thread_id, exc_info=True
+                )
+
+        # Memory records win over stored ones because they reflect live state.
+        merged: dict[str, RunRecord] = {}
+        for d in stored:
+            try:
+                merged[d["run_id"]] = self._record_from_dict(d)
+            except Exception:
+                logger.warning(
+                    "Failed to deserialize run record %s from store", d.get("run_id"), exc_info=True
+                )
+        merged.update(memory_map)
+
+        result = list(merged.values())
+        result.sort(key=lambda r: r.created_at, reverse=True)
+        return result
 
     async def set_status(self, run_id: str, status: RunStatus, *, error: str | None = None) -> None:
         """Transition a run to a new status."""

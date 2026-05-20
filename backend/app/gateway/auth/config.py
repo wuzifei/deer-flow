@@ -22,7 +22,7 @@ class AuthConfig(BaseModel):
         ...,
         description="Secret key for JWT signing. MUST be set via AUTH_JWT_SECRET.",
     )
-    token_expiry_days: int = Field(default=7, ge=1, le=30)
+    token_expiry_days: int = Field(default=15, ge=1, le=30)
     oauth_github_client_id: str | None = Field(default=None)
     oauth_github_client_secret: str | None = Field(default=None)
 
@@ -47,7 +47,10 @@ def get_auth_config() -> AuthConfig:
                 "For production, add AUTH_JWT_SECRET to your .env file: "
                 'python -c "import secrets; print(secrets.token_urlsafe(32))"'
             )
-        _auth_config = AuthConfig(jwt_secret=jwt_secret)
+        _auth_config = AuthConfig(
+            jwt_secret=jwt_secret,
+            token_expiry_days=int(os.environ.get("AUTH_TOKEN_EXPIRY_DAYS", "15")),
+        )
     return _auth_config
 
 

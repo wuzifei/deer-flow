@@ -73,6 +73,8 @@ export default function ChatPage() {
     isHistoryLoading,
     hasMoreHistory,
     loadMoreHistory,
+    runs,
+    runBoundaries,
   } = useThreadStream({
     threadId: isNewThread ? undefined : threadId,
     context: settings.context,
@@ -164,6 +166,8 @@ export default function ChatPage() {
                 loadMoreHistory={loadMoreHistory}
                 isHistoryLoading={isHistoryLoading}
                 tokenUsageInlineMode={tokenUsageInlineMode}
+                runs={runs}
+                runBoundaries={runBoundaries}
               />
             </div>
             <div

@@ -19,16 +19,18 @@ import { sanitizeRunStreamOptions } from "./stream-mode";
  * the contract stays in lockstep.
  */
 function injectCsrfHeader(_url: URL, init: RequestInit): RequestInit {
+  // Always include credentials so HttpOnly access_token cookie is sent.
+  const result: RequestInit = { ...init, credentials: "include" };
   if (!isStateChangingMethod(init.method ?? "GET")) {
-    return init;
+    return result;
   }
   const token = readCsrfCookie();
-  if (!token) return init;
+  if (!token) return result;
   const headers = new Headers(init.headers);
   if (!headers.has("X-CSRF-Token")) {
     headers.set("X-CSRF-Token", token);
   }
-  return { ...init, headers };
+  return { ...result, headers };
 }
 
 function createCompatibleClient(isMock?: boolean): LangGraphClient {

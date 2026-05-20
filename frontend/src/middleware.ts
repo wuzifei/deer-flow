@@ -10,7 +10,7 @@ const GATEWAY_URL = process.env.DEER_FLOW_INTERNAL_GATEWAY_BASE_URL?.trim().repl
 function detectProto(request: NextRequest): string {
   // x-forwarded-proto: https from outer proxy is authoritative
   const xfp = request.headers.get("x-forwarded-proto");
-  if (xfp && xfp.split(",")[0].trim().toLowerCase() === "https") return "https";
+  if (xfp && xfp.split(",")[0]?.trim().toLowerCase() === "https") return "https";
   // Origin header (browser sets on cross-origin and some same-origin requests)
   const origin = request.headers.get("origin");
   if (origin?.startsWith("https://")) return "https";

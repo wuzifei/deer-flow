@@ -123,18 +123,32 @@ if (-not (Test-Path $logDir)) { New-Item -ItemType Directory -Path $logDir | Out
 Write-Host "  Starting Gateway on port $GatewayPort ..." -ForegroundColor Gray
 $gwLog = "$logDir\gateway.log"
 
-# Ensure env vars are clean (no trailing whitespace)
-$env:OPENAI_API_KEY = $env:OPENAI_API_KEY.Trim()
-$env:OPENAI_BASE_URL = $env:OPENAI_BASE_URL.Trim()
+# Ensure env vars are clean
+$env:OPENAI_API_KEY = if ($env:OPENAI_API_KEY) { $env:OPENAI_API_KEY.Trim() }
+$env:OPENAI_BASE_URL = if ($env:OPENAI_BASE_URL) { $env:OPENAI_BASE_URL.Trim() }
 
 # Write a temporary launcher script to avoid cmd.exe set whitespace issues
 $gwLauncher = "$logDir\_start_gateway.cmd"
 $gwPython = "$RepoRoot\backend\.venv\Scripts\python.exe"
+
+# 从 .env 收集所有环境变量，全部传给 gateway 进程
+$envLines = @()
+if (Test-Path $envFile) {
+    Get-Content $envFile -Encoding UTF8 | ForEach-Object {
+        $line = $_.Trim()
+        if ($line -and -not $line.StartsWith('#') -and $line.Contains('=')) {
+            $idx = $line.IndexOf('=')
+            $key = $line.Substring(0, $idx).Trim()
+            $val = ($line.Substring($idx + 1).Trim())
+            $envLines += "set `"$key=$val`""
+        }
+    }
+}
+$envBlock = $envLines -join "`r`n"
 @"
 @echo off
 cd /d "$RepoRoot\backend"
-set "OPENAI_API_KEY=$env:OPENAI_API_KEY"
-set "OPENAI_BASE_URL=$env:OPENAI_BASE_URL"
+$envBlock
 "$gwPython" -m uvicorn app.gateway.app:app --host 0.0.0.0 --port $GatewayPort >> "$gwLog" 2>&1
 "@ | Set-Content $gwLauncher -Encoding ASCII
 

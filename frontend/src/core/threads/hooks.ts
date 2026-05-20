@@ -152,6 +152,8 @@ export function useThreadStream({
     loadMore: loadMoreHistory,
     loading: isHistoryLoading,
     appendMessages,
+    runs: historyRuns,
+    runBoundaries: rawRunBoundaries,
   } = useThreadHistory(onStreamThreadId ?? "");
 
   // Keep listeners ref updated with latest callbacks
@@ -591,6 +593,16 @@ export function useThreadStream({
       )
     : [];
 
+  // 保留边界：只要 firstMessageId 在历史消息或当前消息中存在即可
+  const allMessageIds = new Set(
+    [...history, ...thread.messages, ...optimisticMessages]
+      .map(messageIdentity)
+      .filter((id): id is string => Boolean(id)),
+  );
+  const runBoundaries = rawRunBoundaries.filter((b) =>
+    allMessageIds.has(b.firstMessageId),
+  );
+
   // Merge history, live stream, and optimistic messages for display
   // History messages may overlap with thread.messages; thread.messages take precedence
   const mergedThread = {
@@ -606,6 +618,8 @@ export function useThreadStream({
     isHistoryLoading,
     hasMoreHistory,
     loadMoreHistory,
+    runs: historyRuns,
+    runBoundaries,
   } as const;
 }
 
@@ -617,6 +631,9 @@ export function useThreadHistory(threadId: string) {
   const loadingRef = useRef(false);
   const [loading, setLoading] = useState(false);
   const [messages, setMessages] = useState<Message[]>([]);
+  const [runBoundaries, setRunBoundaries] = useState<
+    Array<{ runId: string; runIndex: number; firstMessageId: string }>
+  >([]);
 
   loadingRef.current = loading;
   const loadMessages = useCallback(async () => {
@@ -644,21 +661,44 @@ export function useThreadHistory(threadId: string) {
       const _messages = result.data
         .filter((m) => !m.metadata.caller?.startsWith("middleware:"))
         .map((m) => m.content);
+      const currentIndex = indexRef.current;
+      const firstMsgWithId = _messages.find((m) => messageIdentity(m) != null);
+      const firstMessageId = firstMsgWithId ? messageIdentity(firstMsgWithId) : undefined;
+      if (firstMessageId) {
+        setRunBoundaries((prev) => [
+          { runId: run.run_id, runIndex: currentIndex, firstMessageId },
+          ...prev,
+        ]);
+      }
       setMessages((prev) => [..._messages, ...prev]);
       indexRef.current -= 1;
     } catch (err) {
       console.error(err);
+      indexRef.current -= 1;
     } finally {
       setLoading(false);
     }
   }, []);
   useEffect(() => {
     threadIdRef.current = threadId;
+    setMessages([]);
+    setRunBoundaries([]);
     if (runs.data && runs.data.length > 0) {
       runsRef.current = runs.data ?? [];
       indexRef.current = runs.data.length - 1;
+    } else {
+      runsRef.current = [];
+      indexRef.current = -1;
     }
-    loadMessages().catch(() => {
+    const loadAll = async () => {
+      let loaded = 0;
+      const MAX_INITIAL_RUNS = 5;
+      while (indexRef.current >= 0 && loaded < MAX_INITIAL_RUNS) {
+        await loadMessages();
+        loaded++;
+      }
+    };
+    loadAll().catch(() => {
       toast.error("Failed to load thread history.");
     });
   }, [threadId, runs.data, loadMessages]);
@@ -676,6 +716,7 @@ export function useThreadHistory(threadId: string) {
     appendMessages,
     hasMore,
     loadMore: loadMessages,
+    runBoundaries,
   };
 }
 

@@ -1,6 +1,6 @@
-import type { Message } from "@langchain/langgraph-sdk";
+import type { Message, Run } from "@langchain/langgraph-sdk";
 import type { BaseStream } from "@langchain/langgraph-sdk/react";
-import { ChevronUpIcon, Loader2Icon } from "lucide-react";
+import { AlertTriangle, ChevronUpIcon, Loader2Icon } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef } from "react";
 
 import {
@@ -42,6 +42,7 @@ import {
   MessageTokenUsageList,
 } from "./message-token-usage";
 import { MessageListSkeleton } from "./skeleton";
+import { RunBoundary } from "./run-boundary";
 import { SubtaskCard } from "./subtask-card";
 
 export const MESSAGE_LIST_DEFAULT_PADDING_BOTTOM = 24;
@@ -162,6 +163,8 @@ export function MessageList({
   hasMoreHistory,
   loadMoreHistory,
   isHistoryLoading,
+  runs,
+  runBoundaries,
 }: {
   className?: string;
   threadId: string;
@@ -171,6 +174,8 @@ export function MessageList({
   hasMoreHistory?: boolean;
   loadMoreHistory?: () => void;
   isHistoryLoading?: boolean;
+  runs?: Run[];
+  runBoundaries?: Array<{ runId: string; runIndex: number; firstMessageId: string }>;
 }) {
   const { t } = useI18n();
   const rehypePlugins = useRehypeSplitWordsIntoSpans(thread.isLoading);
@@ -183,6 +188,17 @@ export function MessageList({
     () => buildTokenDebugSteps(messages, t),
     [messages, t],
   );
+
+  const boundaryMap = useMemo(() => {
+    if (!runBoundaries)
+      return new Map<string, { runId: string; runIndex: number }>();
+    return new Map(runBoundaries.map((b) => [b.firstMessageId, b]));
+  }, [runBoundaries]);
+
+  const latestRun = runs?.[runs.length - 1];
+  const hasMultipleRuns = (runs?.length ?? 0) > 1;
+  const latestRunFailed =
+    hasMultipleRuns && (latestRun as any)?.status === "error";
 
   const renderAssistantCopyButton = useCallback((messages: Message[]) => {
     const clipboardData = [...messages]
@@ -260,60 +276,94 @@ export function MessageList({
       className={cn("flex size-full flex-col justify-center", className)}
     >
       <ConversationContent className="mx-auto w-full max-w-(--container-width-md) gap-8 pt-8">
+        {/* Run history loaded successfully */}
         <LoadMoreHistoryIndicator
           isLoading={isHistoryLoading}
           hasMore={hasMoreHistory}
           loadMore={loadMoreHistory}
         />
+        {latestRunFailed && (
+          <div className="flex items-center gap-2 rounded-md border border-amber-200 bg-amber-50 px-3 py-2 my-2 text-xs text-amber-800">
+            <AlertTriangle className="size-4 shrink-0" />
+            <span>
+              该会话共 {runs!.length} 次运行。当前显示的是最新运行（失败），下方有更早的运行记录。
+            </span>
+          </div>
+        )}
         {groupedMessages.map((group, groupIndex) => {
           const turnUsageMessages = turnUsageMessagesByGroupIndex[groupIndex];
+          const firstMsgWithId = group.messages.find((msg) => {
+            const id = "tool_call_id" in msg ? msg.tool_call_id : msg.id;
+            return id != null;
+          });
+          const firstMsgId = firstMsgWithId
+            ? "tool_call_id" in firstMsgWithId
+              ? firstMsgWithId.tool_call_id
+              : firstMsgWithId.id
+            : undefined;
+          const boundary = firstMsgId ? boundaryMap.get(firstMsgId) : undefined;
+
+          const boundaryRun = boundary && runs ? runs[boundary.runIndex] : undefined;
+          const runBoundaryNode = boundaryRun && boundary ? (
+            <RunBoundary
+              key={`boundary-${boundary.runId}`}
+              run={boundaryRun}
+              runIndex={boundary.runIndex}
+            />
+          ) : null;
 
           if (group.type === "human" || group.type === "assistant") {
             return (
-              <div
-                key={`${groupIndex}:${group.id}`}
-                className={cn(
-                  "w-full",
-                  group.type === "assistant" && "group/assistant-turn",
-                )}
-              >
-                {group.messages.map((msg) => {
-                  return (
-                    <MessageListItem
-                      key={`${group.id}/${msg.id}`}
-                      message={msg}
-                      isLoading={thread.isLoading}
-                      threadId={threadId}
-                      showCopyButton={group.type !== "assistant"}
-                    />
-                  );
-                })}
-                {renderTokenUsage({
-                  messages: group.messages,
-                  turnUsageMessages,
-                })}
-                {group.type === "assistant" &&
-                  renderAssistantCopyButton(group.messages)}
-              </div>
+              <>
+                {runBoundaryNode}
+                <div
+                  key={`${groupIndex}:${group.id}`}
+                  className={cn(
+                    "w-full",
+                    group.type === "assistant" && "group/assistant-turn",
+                  )}
+                >
+                  {group.messages.map((msg) => {
+                    return (
+                      <MessageListItem
+                        key={`${group.id}/${msg.id}`}
+                        message={msg}
+                        isLoading={thread.isLoading}
+                        threadId={threadId}
+                        showCopyButton={group.type !== "assistant"}
+                      />
+                    );
+                  })}
+                  {renderTokenUsage({
+                    messages: group.messages,
+                    turnUsageMessages,
+                  })}
+                  {group.type === "assistant" &&
+                    renderAssistantCopyButton(group.messages)}
+                </div>
+              </>
             );
           } else if (group.type === "assistant:clarification") {
             const message = group.messages[0];
             if (message && hasContent(message)) {
               return (
-                <div key={`${groupIndex}:${group.id}`} className="w-full">
-                  <MarkdownContent
-                    content={extractContentFromMessage(message)}
-                    isLoading={thread.isLoading}
-                    rehypePlugins={rehypePlugins}
-                  />
-                  {renderTokenUsage({
-                    messages: group.messages,
-                    turnUsageMessages,
-                  })}
-                </div>
+                <>
+                  {runBoundaryNode}
+                  <div key={`${groupIndex}:${group.id}`} className="w-full">
+                    <MarkdownContent
+                      content={extractContentFromMessage(message)}
+                      isLoading={thread.isLoading}
+                      rehypePlugins={rehypePlugins}
+                    />
+                    {renderTokenUsage({
+                      messages: group.messages,
+                      turnUsageMessages,
+                    })}
+                  </div>
+                </>
               );
             }
-            return null;
+            return runBoundaryNode;
           } else if (group.type === "assistant:present-files") {
             const files: string[] = [];
             for (const message of group.messages) {
@@ -323,21 +373,24 @@ export function MessageList({
               }
             }
             return (
-              <div className="w-full" key={`${groupIndex}:${group.id}`}>
-                {group.messages[0] && hasContent(group.messages[0]) && (
-                  <MarkdownContent
-                    content={extractContentFromMessage(group.messages[0])}
-                    isLoading={thread.isLoading}
-                    rehypePlugins={rehypePlugins}
-                    className="mb-4"
-                  />
-                )}
-                <ArtifactFileList files={files} threadId={threadId} />
-                {renderTokenUsage({
-                  messages: group.messages,
-                  turnUsageMessages,
-                })}
-              </div>
+              <>
+                {runBoundaryNode}
+                <div className="w-full" key={`${groupIndex}:${group.id}`}>
+                  {group.messages[0] && hasContent(group.messages[0]) && (
+                    <MarkdownContent
+                      content={extractContentFromMessage(group.messages[0])}
+                      isLoading={thread.isLoading}
+                      rehypePlugins={rehypePlugins}
+                      className="mb-4"
+                    />
+                  )}
+                  <ArtifactFileList files={files} threadId={threadId} />
+                  {renderTokenUsage({
+                    messages: group.messages,
+                    turnUsageMessages,
+                  })}
+                </div>
+              </>
             );
           } else if (group.type === "assistant:subagent") {
             const tasks = new Set<Subtask>();
@@ -436,37 +489,43 @@ export function MessageList({
               }
             }
             return (
-              <div
-                key={`subtask-group-${groupIndex}:${group.id}`}
-                className="relative z-1 flex flex-col gap-2"
-              >
-                {results}
-                {renderTokenUsage({
-                  messages: group.messages,
-                  turnUsageMessages,
-                  debugMessageIds: subagentDebugMessageIds,
-                })}
-              </div>
+              <>
+                {runBoundaryNode}
+                <div
+                  key={`subtask-group-${groupIndex}:${group.id}`}
+                  className="relative z-1 flex flex-col gap-2"
+                >
+                  {results}
+                  {renderTokenUsage({
+                    messages: group.messages,
+                    turnUsageMessages,
+                    debugMessageIds: subagentDebugMessageIds,
+                  })}
+                </div>
+              </>
             );
           }
           return (
-            <div key={`group-${groupIndex}:${group.id}`} className="w-full">
-              <MessageGroup
-                messages={group.messages}
-                isLoading={thread.isLoading}
-                tokenDebugSteps={tokenDebugSteps.filter((step) =>
-                  group.messages.some(
-                    (message) => message.id === step.messageId,
-                  ),
-                )}
-                showTokenDebugSummaries={tokenUsageInlineMode === "step_debug"}
-              />
-              {renderTokenUsage({
-                messages: group.messages,
-                turnUsageMessages,
-                inlineDebug: false,
-              })}
-            </div>
+            <>
+              {runBoundaryNode}
+              <div key={`group-${groupIndex}:${group.id}`} className="w-full">
+                <MessageGroup
+                  messages={group.messages}
+                  isLoading={thread.isLoading}
+                  tokenDebugSteps={tokenDebugSteps.filter((step) =>
+                    group.messages.some(
+                      (message) => message.id === step.messageId,
+                    ),
+                  )}
+                  showTokenDebugSummaries={tokenUsageInlineMode === "step_debug"}
+                />
+                {renderTokenUsage({
+                  messages: group.messages,
+                  turnUsageMessages,
+                  inlineDebug: false,
+                })}
+              </div>
+            </>
           );
         })}
         {thread.isLoading && <StreamingIndicator className="my-4" />}
