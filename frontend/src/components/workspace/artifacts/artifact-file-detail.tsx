@@ -5,10 +5,11 @@ import {
   EyeIcon,
   LoaderIcon,
   PackageIcon,
+  ShareIcon,
   SquareArrowOutUpRightIcon,
   XIcon,
 } from "lucide-react";
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { toast } from "sonner";
 import { Streamdown } from "streamdown";
 
@@ -20,6 +21,13 @@ import {
   ArtifactHeader,
   ArtifactTitle,
 } from "@/components/ai-elements/artifact";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
 import { Select, SelectItem } from "@/components/ui/select";
 import {
   SelectContent,
@@ -31,6 +39,8 @@ import { ToggleGroup, ToggleGroupItem } from "@/components/ui/toggle-group";
 import { CodeEditor } from "@/components/workspace/code-editor";
 import { useArtifactContent } from "@/core/artifacts/hooks";
 import { urlOfArtifact } from "@/core/artifacts/utils";
+import { fetch as fetchWithCsrf } from "@/core/api/fetcher";
+import { getBackendBaseURL } from "@/core/config";
 import { useI18n } from "@/core/i18n/hooks";
 import { installSkill } from "@/core/skills/api";
 import { streamdownPlugins } from "@/core/streamdown";
@@ -93,6 +103,10 @@ export function ArtifactFileDetail({
 
   const [viewMode, setViewMode] = useState<"code" | "preview">("code");
   const [isInstalling, setIsInstalling] = useState(false);
+  const [shareDialogOpen, setShareDialogOpen] = useState(false);
+  const [shareLoading, setShareLoading] = useState(false);
+  const [shareToken, setShareToken] = useState("");
+  const shareAbortRef = useRef<AbortController | null>(null);
   const { isMock } = useThread();
   useEffect(() => {
     if (isSupportPreview) {
@@ -123,6 +137,36 @@ export function ArtifactFileDetail({
       setIsInstalling(false);
     }
   }, [threadId, filepath, isInstalling]);
+
+  const handleShare = useCallback(async () => {
+    if (shareLoading) return;
+    shareAbortRef.current?.abort();
+    const ac = new AbortController();
+    shareAbortRef.current = ac;
+    setShareLoading(true);
+    try {
+      const baseUrl = getBackendBaseURL();
+      const res = await fetchWithCsrf(`${baseUrl}/api/share/`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        signal: ac.signal,
+        body: JSON.stringify({ thread_id: threadId, artifact_path: filepath }),
+      });
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({}));
+        toast.error(err.detail || "创建分享链接失败");
+        return;
+      }
+      const data = await res.json();
+      setShareToken(data.share_token);
+      setShareDialogOpen(true);
+    } catch (e: unknown) {
+      if (e instanceof DOMException && e.name === "AbortError") return;
+      toast.error("创建分享链接失败");
+    } finally {
+      setShareLoading(false);
+    }
+  }, [threadId, filepath, shareLoading]);
   return (
     <Artifact className={cn(className)}>
       <ArtifactHeader className="px-2">
@@ -202,6 +246,15 @@ export function ArtifactFileDetail({
                 }}
               />
             )}
+            {!isWriteFile && (
+              <ArtifactAction
+                icon={shareLoading ? LoaderIcon : ShareIcon}
+                label={t.common.share}
+                tooltip={t.common.share}
+                disabled={shareLoading}
+                onClick={handleShare}
+              />
+            )}
             {isCodeFile && (
               <ArtifactAction
                 icon={CopyIcon}
@@ -271,6 +324,33 @@ export function ArtifactFileDetail({
           />
         )}
       </ArtifactContent>
+
+      <Dialog open={shareDialogOpen} onOpenChange={setShareDialogOpen}>
+        <DialogContent className="max-w-[calc(100vw-2rem)] sm:max-w-md">
+          <DialogHeader>
+            <DialogTitle>{t.common.share}</DialogTitle>
+            <DialogDescription className="sr-only">
+              分享链接
+            </DialogDescription>
+          </DialogHeader>
+          <div className="flex flex-col gap-3">
+            <ShareLinkRow
+              label="相对路径"
+              value={shareToken ? `${getBackendBaseURL()}/api/share/${shareToken}`.replace(/^https?:\/\/[^/]+/, "") : ""}
+              onCopy={t.clipboard.copiedToClipboard}
+            />
+            <ShareLinkRow
+              label="绝对路径"
+              value={
+                shareToken
+                  ? `${getBackendBaseURL()}/api/share/${shareToken}`
+                  : ""
+              }
+              onCopy={t.clipboard.copiedToClipboard}
+            />
+          </div>
+        </DialogContent>
+      </Dialog>
     </Artifact>
   );
 }
@@ -323,4 +403,49 @@ export function ArtifactFilePreview({
     );
   }
   return null;
+}
+
+function ShareLinkRow({
+  label,
+  value,
+  onCopy,
+}: {
+  label: string;
+  value: string;
+  onCopy: string;
+}) {
+  const [copied, setCopied] = useState(false);
+
+  const handleCopy = async () => {
+    try {
+      await navigator.clipboard.writeText(value);
+      setCopied(true);
+      toast.success(onCopy);
+      setTimeout(() => setCopied(false), 2000);
+    } catch {
+      toast.error("复制失败");
+    }
+  };
+
+  return (
+    <div className="flex flex-col gap-1">
+      <span className="text-muted-foreground text-xs">{label}</span>
+      <div className="flex items-center gap-2">
+        <code className="bg-muted min-w-0 flex-1 overflow-hidden break-all rounded px-2 py-1.5 text-xs">
+          {value}
+        </code>
+        <button
+          type="button"
+          onClick={handleCopy}
+          className="text-muted-foreground hover:text-foreground shrink-0 transition-colors"
+        >
+          {copied ? (
+            <span className="text-xs text-green-500">已复制</span>
+          ) : (
+            <CopyIcon className="size-4" />
+          )}
+        </button>
+      </div>
+    </div>
+  );
 }

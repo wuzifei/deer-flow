@@ -76,6 +76,10 @@ class AuthMiddleware(BaseHTTPMiddleware):
         if _is_public(request.url.path):
             return await call_next(request)
 
+        # 分享链接公开访问：仅 GET /api/share/{token} 免认证
+        if request.method == "GET" and request.url.path.startswith("/api/share/"):
+            return await call_next(request)
+
         internal_user = None
         if is_valid_internal_auth_token(request.headers.get(INTERNAL_AUTH_HEADER_NAME)):
             internal_user = get_internal_user()
