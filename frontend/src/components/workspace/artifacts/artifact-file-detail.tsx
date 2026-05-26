@@ -348,6 +348,17 @@ export function ArtifactFileDetail({
               }
               onCopy={t.clipboard.copiedToClipboard}
             />
+            {env.NEXT_PUBLIC_INTRANET_BASE_URL && (
+              <ShareLinkRow
+                label="内网链接"
+                value={
+                  shareToken
+                    ? `${env.NEXT_PUBLIC_INTRANET_BASE_URL}/api/share/${shareToken}`
+                    : ""
+                }
+                onCopy={t.clipboard.copiedToClipboard}
+              />
+            )}
           </div>
         </DialogContent>
       </Dialog>
