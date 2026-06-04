@@ -3,7 +3,7 @@
 # Optional: -GatewayPort 8001 -FrontendPort 3000
 
 param(
-    [int]$GatewayPort  = 8002,
+    [int]$GatewayPort  = 8001,
     [int]$FrontendPort = 3000
 )
 
@@ -131,7 +131,7 @@ $env:OPENAI_BASE_URL = if ($env:OPENAI_BASE_URL) { $env:OPENAI_BASE_URL.Trim() }
 $gwLauncher = "$logDir\_start_gateway.cmd"
 $gwPython = "$RepoRoot\backend\.venv\Scripts\python.exe"
 
-# 从 .env 收集所有环境变量，全部传给 gateway 进程
+# �?.env 收集所有环境变量，全部传给 gateway 进程
 $envLines = @()
 if (Test-Path $envFile) {
     Get-Content $envFile -Encoding UTF8 | ForEach-Object {

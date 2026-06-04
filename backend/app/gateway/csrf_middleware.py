@@ -203,6 +203,12 @@ class CSRFMiddleware(BaseHTTPMiddleware):
                 content={"detail": "Cross-site auth request denied."},
             )
 
+        # 豁免 internal token 认证的请求（OPC DeerFlow adapter 使用）
+        from app.gateway.internal_auth import INTERNAL_AUTH_HEADER_NAME, is_valid_internal_auth_token
+        internal_token = request.headers.get(INTERNAL_AUTH_HEADER_NAME)
+        if is_valid_internal_auth_token(internal_token):
+            return await call_next(request)
+
         if should_check_csrf(request) and not _is_auth:
             cookie_token = request.cookies.get(CSRF_COOKIE_NAME)
             header_token = request.headers.get(CSRF_HEADER_NAME)
