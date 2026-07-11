@@ -1,9 +1,10 @@
 import threading
 import time
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, call, patch
 
 from deerflow.agents.memory.queue import ConversationContext, MemoryUpdateQueue
 from deerflow.config.memory_config import MemoryConfig
+from deerflow.trace_context import get_current_trace_id, request_trace_context
 
 
 def _memory_config(**overrides: object) -> MemoryConfig:
@@ -51,6 +52,7 @@ def test_process_queue_forwards_correction_flag_to_updater() -> None:
         correction_detected=True,
         reinforcement_detected=False,
         user_id=None,
+        deerflow_trace_id=None,
     )
 
 
@@ -92,6 +94,7 @@ def test_process_queue_forwards_reinforcement_flag_to_updater() -> None:
         correction_detected=False,
         reinforcement_detected=True,
         user_id=None,
+        deerflow_trace_id=None,
     )
 
 
@@ -164,3 +167,238 @@ def test_flush_nowait_is_non_blocking() -> None:
     assert elapsed < 0.1
     assert finished.is_set() is False
     assert finished.wait(1.0) is True
+
+
+def test_queue_keeps_updates_for_different_agents_in_same_thread() -> None:
+    queue = MemoryUpdateQueue()
+
+    with (
+        patch("deerflow.agents.memory.queue.get_memory_config", return_value=_memory_config(enabled=True)),
+        patch.object(queue, "_reset_timer"),
+    ):
+        queue.add(thread_id="thread-1", messages=["agent-a"], agent_name="agent-a")
+        queue.add(thread_id="thread-1", messages=["agent-b"], agent_name="agent-b")
+
+    assert queue.pending_count == 2
+    assert [context.agent_name for context in queue._queue] == ["agent-a", "agent-b"]
+
+
+def test_queue_still_coalesces_updates_for_same_agent_in_same_thread() -> None:
+    queue = MemoryUpdateQueue()
+
+    with (
+        patch("deerflow.agents.memory.queue.get_memory_config", return_value=_memory_config(enabled=True)),
+        patch.object(queue, "_reset_timer"),
+    ):
+        queue.add(
+            thread_id="thread-1",
+            messages=["first"],
+            agent_name="agent-a",
+            correction_detected=True,
+        )
+        queue.add(
+            thread_id="thread-1",
+            messages=["second"],
+            agent_name="agent-a",
+            correction_detected=False,
+        )
+
+    assert queue.pending_count == 1
+    assert queue._queue[0].agent_name == "agent-a"
+    assert queue._queue[0].messages == ["second"]
+    assert queue._queue[0].correction_detected is True
+
+
+def test_process_queue_updates_different_agents_in_same_thread_separately() -> None:
+    queue = MemoryUpdateQueue()
+
+    with (
+        patch("deerflow.agents.memory.queue.get_memory_config", return_value=_memory_config(enabled=True)),
+        patch.object(queue, "_reset_timer"),
+    ):
+        queue.add(thread_id="thread-1", messages=["agent-a"], agent_name="agent-a")
+        queue.add(thread_id="thread-1", messages=["agent-b"], agent_name="agent-b")
+
+    mock_updater = MagicMock()
+    mock_updater.update_memory.return_value = True
+
+    with (
+        patch("deerflow.agents.memory.updater.MemoryUpdater", return_value=mock_updater),
+        patch("deerflow.agents.memory.queue.time.sleep"),
+    ):
+        queue.flush()
+
+    assert mock_updater.update_memory.call_count == 2
+    mock_updater.update_memory.assert_has_calls(
+        [
+            call(
+                messages=["agent-a"],
+                thread_id="thread-1",
+                agent_name="agent-a",
+                correction_detected=False,
+                reinforcement_detected=False,
+                user_id=None,
+                deerflow_trace_id=None,
+            ),
+            call(
+                messages=["agent-b"],
+                thread_id="thread-1",
+                agent_name="agent-b",
+                correction_detected=False,
+                reinforcement_detected=False,
+                user_id=None,
+                deerflow_trace_id=None,
+            ),
+        ]
+    )
+
+
+def test_process_queue_forwards_deerflow_trace_id_to_updater() -> None:
+    queue = MemoryUpdateQueue()
+    queue._queue = [
+        ConversationContext(
+            thread_id="thread-1",
+            messages=["conversation"],
+            agent_name="lead_agent",
+            deerflow_trace_id="trace-memory-1",
+        )
+    ]
+    mock_updater = MagicMock()
+    mock_updater.update_memory.return_value = True
+
+    with patch("deerflow.agents.memory.updater.MemoryUpdater", return_value=mock_updater):
+        queue._process_queue()
+
+    mock_updater.update_memory.assert_called_once_with(
+        messages=["conversation"],
+        thread_id="thread-1",
+        agent_name="lead_agent",
+        correction_detected=False,
+        reinforcement_detected=False,
+        user_id=None,
+        deerflow_trace_id="trace-memory-1",
+    )
+
+
+class TestProcessQueueBindsTraceContextVar:
+    """Regression: ``_process_queue`` runs in a Timer thread where the request
+    trace ContextVar is unbound. The per-context iteration must bind
+    ``ConversationContext.deerflow_trace_id`` into the ContextVar so
+    ``TraceContextFilter`` (which only reads the ContextVar) attaches the correct
+    ``trace_id`` to log records emitted from ``queue.py`` itself (``"Updating
+    memory for thread ..."``, ``"Memory updated successfully..."``, exception
+    logs) — not just from the deep memory-updater stack.
+    """
+
+    @staticmethod
+    def _run_process_queue_in_fresh_thread(queue: MemoryUpdateQueue, mock_updater: MagicMock) -> None:
+        def _target() -> None:
+            with patch("deerflow.agents.memory.updater.MemoryUpdater", return_value=mock_updater):
+                queue._process_queue()
+
+        thread = threading.Thread(target=_target)
+        thread.start()
+        thread.join()
+
+    def test_process_queue_binds_deerflow_trace_id_during_iteration(self) -> None:
+        queue = MemoryUpdateQueue()
+        queue._queue = [
+            ConversationContext(
+                thread_id="thread-1",
+                messages=["conversation"],
+                agent_name="lead_agent",
+                deerflow_trace_id="trace-queue-abc",
+            )
+        ]
+        captured: list[str | None] = []
+        mock_updater = MagicMock()
+
+        def _capture(**_kwargs) -> bool:
+            captured.append(get_current_trace_id())
+            return True
+
+        mock_updater.update_memory.side_effect = _capture
+
+        self._run_process_queue_in_fresh_thread(queue, mock_updater)
+
+        assert captured == ["trace-queue-abc"]
+
+    def test_process_queue_binds_distinct_ids_per_context(self) -> None:
+        """Each queued context must be scoped independently — a per-iteration bind,
+        not a batch-level one — so id A's logs don't bleed into id B's iteration."""
+        queue = MemoryUpdateQueue()
+        queue._queue = [
+            ConversationContext(
+                thread_id="thread-1",
+                messages=["conv-a"],
+                agent_name="agent-a",
+                deerflow_trace_id="trace-a",
+            ),
+            ConversationContext(
+                thread_id="thread-2",
+                messages=["conv-b"],
+                agent_name="agent-b",
+                deerflow_trace_id="trace-b",
+            ),
+        ]
+        captured: list[str | None] = []
+        mock_updater = MagicMock()
+
+        def _capture(**_kwargs) -> bool:
+            captured.append(get_current_trace_id())
+            return True
+
+        mock_updater.update_memory.side_effect = _capture
+
+        with (
+            patch("deerflow.agents.memory.updater.MemoryUpdater", return_value=mock_updater),
+            patch("deerflow.agents.memory.queue.time.sleep"),
+        ):
+            queue._process_queue()
+
+        assert captured == ["trace-a", "trace-b"]
+
+    def test_process_queue_leaves_contextvar_unbound_when_no_trace_id(self) -> None:
+        """A queued context without ``deerflow_trace_id`` must not fabricate one;
+        the ContextVar stays unbound and log records fall through to '-'."""
+        queue = MemoryUpdateQueue()
+        queue._queue = [
+            ConversationContext(
+                thread_id="thread-1",
+                messages=["conversation"],
+                agent_name="lead_agent",
+                deerflow_trace_id=None,
+            )
+        ]
+        captured: list[str | None] = []
+        mock_updater = MagicMock()
+
+        def _capture(**_kwargs) -> bool:
+            captured.append(get_current_trace_id())
+            return True
+
+        mock_updater.update_memory.side_effect = _capture
+
+        self._run_process_queue_in_fresh_thread(queue, mock_updater)
+
+        assert captured == [None]
+
+    def test_process_queue_restores_outer_contextvar_after_return(self) -> None:
+        queue = MemoryUpdateQueue()
+        queue._queue = [
+            ConversationContext(
+                thread_id="thread-1",
+                messages=["conversation"],
+                agent_name="lead_agent",
+                deerflow_trace_id="trace-inner",
+            )
+        ]
+        mock_updater = MagicMock()
+        mock_updater.update_memory.return_value = True
+
+        with (
+            request_trace_context("trace-outer"),
+            patch("deerflow.agents.memory.updater.MemoryUpdater", return_value=mock_updater),
+        ):
+            queue._process_queue()
+            assert get_current_trace_id() == "trace-outer"

@@ -99,7 +99,7 @@ rm -f backend/.deer-flow/data/deerflow.db
 | `.deer-flow/users/{user_id}/memory.json` | 用户级 memory |
 | `.deer-flow/users/{user_id}/agents/{agent_name}/` | 用户自定义 agent 配置、SOUL 和 agent memory |
 | `.deer-flow/admin_initial_credentials.txt` | `reset_admin` 生成的新凭据文件（0600，读完应删除） |
-| `.env` 中的 `AUTH_JWT_SECRET` | JWT 签名密钥（未设置时自动生成临时密钥，重启后 session 失效） |
+| `.env` 中的 `AUTH_JWT_SECRET` | JWT 签名密钥（未设置时自动生成并持久化到 `.deer-flow/.jwt_secret`，重启后 session 保持） |
 
 ### 生产环境建议
 
@@ -124,8 +124,8 @@ python -c "import secrets; print(secrets.token_urlsafe(32))"
 
 ## 兼容性
 
-- **标准模式**（`make dev`）：完全兼容；无 admin 时访问 `/setup` 初始化
-- **Gateway 模式**（`make dev-pro`）：完全兼容
+- **本地开发**（`make dev`）：Gateway embedded runtime 完全兼容；无 admin 时访问 `/setup` 初始化
+- **Gateway embedded runtime**：标准脚本、Docker dev 和生产部署均通过 Gateway 提供认证与 LangGraph-compatible API
 - **Docker 部署**：完全兼容，`.deer-flow/data/deerflow.db` 需持久化卷挂载
 - **IM 渠道**（Feishu/Slack/Telegram）：通过 Gateway 内部认证通信，使用 `default` 用户桶
 - **DeerFlowClient**（嵌入式）：不经过 HTTP，不受认证影响
@@ -137,4 +137,4 @@ python -c "import secrets; print(secrets.token_urlsafe(32))"
 | 启动后没看到密码 | 当前实现不在启动日志输出密码 | 首次安装访问 `/setup`；忘记密码用 `reset_admin` |
 | `/login` 自动跳到 `/setup` | 系统还没有 admin | 在 `/setup` 创建第一个 admin |
 | 登录后 POST 返回 403 | CSRF token 缺失 | 确认前端已更新 |
-| 重启后需要重新登录 | `AUTH_JWT_SECRET` 未持久化 | 在 `.env` 中设置固定密钥 |
+| 重启后需要重新登录 | `.jwt_secret` 文件被删除且 `.env` 未设置 `AUTH_JWT_SECRET` | 在 `.env` 中设置固定密钥 |

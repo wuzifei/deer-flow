@@ -5,14 +5,14 @@ Order of resolution:
 1. `UV_EXTRAS` env var. Comma- or whitespace-separated names so multiple
    extras can be layered (e.g. ``UV_EXTRAS=postgres,ollama``). The same
    parsing semantics apply in the Docker dev container via
-   ``docker/dev-entrypoint.sh``. The Docker image-build path
-   (``backend/Dockerfile``) still treats `UV_EXTRAS` as a single token, so
-   ``UV_EXTRAS=postgres,ollama`` would only install ``postgres,ollama`` as
-   one (invalid) extra at build time — author build-time values as a
-   single name.
+   ``docker/dev-entrypoint.sh`` and in the production Docker image build via
+   ``backend/Dockerfile``.
 2. Auto-detection from config.yaml — currently maps:
    - database.backend == postgres        -> postgres
    - checkpointer.type == postgres       -> postgres
+   - stream_bridge.type == redis         -> redis
+3. Runtime environment toggles that enable optional backends:
+   - DEER_FLOW_STREAM_BRIDGE_REDIS_URL   -> redis
 
 Each extra name is validated against ``^[A-Za-z][A-Za-z0-9_-]*$`` (the same
 shape uv enforces for `[project.optional-dependencies]` keys). Anything else
@@ -72,6 +72,7 @@ def find_config_file() -> Path | None:
 
 
 _SECTION_RE = re.compile(r"^([A-Za-z_][\w-]*)\s*:\s*$")
+_INDENTED_SECTION_RE = re.compile(r"^\s+([A-Za-z_][\w-]*)\s*:\s*$")
 _KEY_RE = re.compile(r"^\s+([A-Za-z_][\w-]*)\s*:\s*(\S.*?)\s*$")
 
 
@@ -141,6 +142,84 @@ def section_value(lines: list[str], section: str, key: str) -> str | None:
     return None
 
 
+def nested_section_value(lines: list[str], section_path: str, key: str) -> str | None:
+    """Return the value of a nested YAML key like ``channels.discord.enabled``.
+
+    Handles two levels of nesting:
+        channels:
+          discord:
+            enabled: true
+    """
+    parts = section_path.split(".")
+    if len(parts) != 2:
+        return None
+    parent_section, child_section = parts
+
+    inside_parent = False
+    inside_child = False
+    parent_indent: int | None = None
+    child_indent: int | None = None
+
+    for raw in lines:
+        line = _strip_comment(raw)
+        if not line.strip():
+            continue
+
+        stripped = line.lstrip()
+        indent = len(line) - len(stripped)
+
+        # Top-level section match
+        sect_match = _SECTION_RE.match(line)
+        if sect_match:
+            if indent == 0:
+                inside_parent = sect_match.group(1) == parent_section
+            inside_child = False
+            parent_indent = None
+            child_indent = None
+            continue
+
+        if not inside_parent:
+            continue
+
+        # Track parent indent from first child
+        if parent_indent is None and indent > 0:
+            parent_indent = indent
+
+        # If indent goes back to 0, we left the parent section
+        if indent == 0:
+            inside_parent = False
+            inside_child = False
+            continue
+
+        # Check if we're at the parent's child level (subsection)
+        if parent_indent is not None and indent == parent_indent:
+            # This could be a subsection or a direct key of parent
+            sub_match = _INDENTED_SECTION_RE.match(line)
+            if sub_match and sub_match.group(1) == child_section:
+                inside_child = True
+                child_indent = None
+                continue
+            else:
+                inside_child = False
+                continue
+
+        if not inside_child:
+            continue
+
+        # We're inside the subsection — track child indent
+        if child_indent is None and indent > (parent_indent or 0):
+            child_indent = indent
+
+        if child_indent is not None and indent != child_indent:
+            continue
+
+        key_match = _KEY_RE.match(line)
+        if key_match and key_match.group(1) == key:
+            return _unquote(key_match.group(2).strip())
+
+    return None
+
+
 def detect_from_config(path: Path) -> list[str]:
     try:
         text = path.read_text(encoding="utf-8", errors="replace")
@@ -152,17 +231,41 @@ def detect_from_config(path: Path) -> list[str]:
         extras.add("postgres")
     if (section_value(lines, "checkpointer", "type") or "").lower() == "postgres":
         extras.add("postgres")
+    if (section_value(lines, "stream_bridge", "type") or "").lower() == "redis":
+        extras.add("redis")
+    if (nested_section_value(lines, "channels.discord", "enabled") or "").lower() == "true":
+        extras.add("discord")
     return sorted(extras)
 
 
+def detect_from_runtime_env() -> list[str]:
+    extras: set[str] = set()
+    if os.environ.get("DEER_FLOW_STREAM_BRIDGE_REDIS_URL", "").strip():
+        extras.add("redis")
+    return sorted(extras)
+
+
+def merge_extras(*groups: list[str]) -> list[str]:
+    merged: list[str] = []
+    seen: set[str] = set()
+    for group in groups:
+        for extra in group:
+            if extra in seen:
+                continue
+            seen.add(extra)
+            merged.append(extra)
+    return merged
+
+
 def resolve_extras() -> list[str]:
+    runtime_env_extras = detect_from_runtime_env()
     env = os.environ.get("UV_EXTRAS", "")
     if env.strip():
-        return parse_env_extras(env)
+        return merge_extras(parse_env_extras(env), runtime_env_extras)
     config = find_config_file()
     if config is None:
-        return []
-    return detect_from_config(config)
+        return runtime_env_extras
+    return merge_extras(detect_from_config(config), runtime_env_extras)
 
 
 def format_flags(extras: list[str]) -> str:

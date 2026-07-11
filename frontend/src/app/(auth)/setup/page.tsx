@@ -10,6 +10,10 @@ import { Input } from "@/components/ui/input";
 import { getCsrfHeaders } from "@/core/api/fetcher";
 import { getBackendBaseURL } from "@/core/config";
 import { useAuth } from "@/core/auth/AuthProvider";
+import {
+  fetchSetupStatus,
+  isSystemAlreadyInitializedError,
+} from "@/core/auth/setup";
 import { parseAuthError } from "@/core/auth/types";
 
 type SetupMode = "loading" | "init_admin" | "change_password";
@@ -37,23 +41,22 @@ export default function SetupPage() {
       setMode("change_password");
     } else if (!isAuthenticated) {
       // Check if the system has no users yet
-      void fetch(`${getBackendBaseURL()}/api/v1/auth/setup-status`)
-        .then((r) => r.json())
+      void fetchSetupStatus()
         .then((data: { needs_setup?: boolean }) => {
           if (cancelled) return;
           if (data.needs_setup) {
             setMode("init_admin");
           } else {
-            // System already set up and user is not logged in â€” go to login
-            router.push("/login");
+            // System already set up and user is not logged in â€go to login
+            router.replace("/login");
           }
         })
         .catch(() => {
-          if (!cancelled) router.push("/login");
+          if (!cancelled) router.replace("/login");
         });
     } else {
-      // Authenticated but needs_setup is false â€” already set up
-      router.push("/workspace");
+      // Authenticated but needs_setup is false â€already set up
+      router.replace("/workspace");
     }
 
     return () => {
@@ -85,6 +88,10 @@ export default function SetupPage() {
 
       if (!res.ok) {
         const data = await res.json();
+        if (isSystemAlreadyInitializedError(data)) {
+          router.replace("/login");
+          return;
+        }
         const authError = parseAuthError(data);
         setError(authError.message);
         return;
@@ -148,7 +155,7 @@ export default function SetupPage() {
   if (mode === "loading") {
     return (
       <div className="flex min-h-screen items-center justify-center">
-        <p className="text-muted-foreground text-sm">Loadingâ€¦</p>
+        <p className="text-muted-foreground text-sm">Loadingâ€/p>
       </div>
     );
   }
@@ -217,7 +224,7 @@ export default function SetupPage() {
             </div>
             {error && <p className="ms-1 text-sm text-red-500">{error}</p>}
             <Button type="submit" className="w-full" disabled={loading}>
-              {loading ? "Creating accountâ€¦" : "Create Admin Account"}
+              {loading ? "Creating accountâ€ : "Create Admin Account"}
             </Button>
           </form>
         </div>
@@ -279,7 +286,7 @@ export default function SetupPage() {
           />
           {error && <p className="text-sm text-red-500">{error}</p>}
           <Button type="submit" className="w-full" disabled={loading}>
-            {loading ? "Setting upâ€¦" : "Complete Setup"}
+            {loading ? "Setting upâ€ : "Complete Setup"}
           </Button>
         </form>
       </div>

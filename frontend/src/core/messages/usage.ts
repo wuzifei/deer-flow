@@ -14,9 +14,21 @@ export function getUsageMetadata(message: Message): TokenUsage | null {
   if (message.type !== "ai") {
     return null;
   }
-  const usage = (message as Record<string, unknown>).usage_metadata as
-    | { input_tokens?: number; output_tokens?: number; total_tokens?: number }
-    | undefined;
+  const usage =
+    ((message as Record<string, unknown>).usage_metadata as
+      | {
+          input_tokens?: number;
+          output_tokens?: number;
+          total_tokens?: number;
+        }
+      | undefined) ??
+    (message.additional_kwargs?.usage_metadata as
+      | {
+          input_tokens?: number;
+          output_tokens?: number;
+          total_tokens?: number;
+        }
+      | undefined);
   if (!usage) {
     return null;
   }
@@ -65,7 +77,41 @@ export function accumulateUsage(messages: Message[]): TokenUsage | null {
   return hasUsage ? cumulative : null;
 }
 
-function hasNonZeroUsage(
+/**
+ * Validate a raw `{input,output,total}_tokens` object into {@link TokenUsage}.
+ *
+ * The single shared validator for both sub-agent usage surfaces — the live
+ * `task_running` event (`core/tasks/lifecycle.ts`) and the terminal ToolMessage
+ * metadata (`core/tasks/subtask-result.ts`). Keeping one function stops the two
+ * from drifting (e.g. one accepting an extra token field the other rejects).
+ * Every key must be a finite, non-negative number or the whole snapshot is
+ * rejected as `undefined`.
+ */
+export function normalizeTokenUsage(value: unknown): TokenUsage | undefined {
+  if (typeof value !== "object" || value === null) {
+    return undefined;
+  }
+  const record = value as Record<string, unknown>;
+  const inputTokens = nonNegativeNumber(record.input_tokens);
+  const outputTokens = nonNegativeNumber(record.output_tokens);
+  const totalTokens = nonNegativeNumber(record.total_tokens);
+  if (
+    inputTokens === undefined ||
+    outputTokens === undefined ||
+    totalTokens === undefined
+  ) {
+    return undefined;
+  }
+  return { inputTokens, outputTokens, totalTokens };
+}
+
+function nonNegativeNumber(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isFinite(value) && value >= 0
+    ? value
+    : undefined;
+}
+
+export function hasNonZeroUsage(
   usage: TokenUsage | null | undefined,
 ): usage is TokenUsage {
   return (
@@ -75,7 +121,7 @@ function hasNonZeroUsage(
   );
 }
 
-function addUsage(base: TokenUsage, delta: TokenUsage): TokenUsage {
+export function addUsage(base: TokenUsage, delta: TokenUsage): TokenUsage {
   return {
     inputTokens: base.inputTokens + delta.inputTokens,
     outputTokens: base.outputTokens + delta.outputTokens,

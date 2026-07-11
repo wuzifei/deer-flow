@@ -11,7 +11,6 @@ import {
 } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { toast } from "sonner";
-import { Streamdown } from "streamdown";
 
 import {
   Artifact,
@@ -21,6 +20,7 @@ import {
   ArtifactHeader,
   ArtifactTitle,
 } from "@/components/ai-elements/artifact";
+import { Button } from "@/components/ui/button";
 import {
   Dialog,
   DialogContent,
@@ -38,21 +38,42 @@ import {
 import { ToggleGroup, ToggleGroupItem } from "@/components/ui/toggle-group";
 import { CodeEditor } from "@/components/workspace/code-editor";
 import { useArtifactContent } from "@/core/artifacts/hooks";
+import {
+  appendHtmlPreviewBaseHref,
+  appendHtmlPreviewScrollRestoration,
+  createHtmlPreviewScrollKey,
+  getArtifactViewState,
+  HTML_PREVIEW_SCROLL_MESSAGE_SOURCE,
+} from "@/core/artifacts/preview";
 import { urlOfArtifact } from "@/core/artifacts/utils";
 import { fetch as fetchWithCsrf } from "@/core/api/fetcher";
 import { getBackendBaseURL } from "@/core/config";
+import { useAuth } from "@/core/auth/AuthProvider";
+import { extractCitationSources } from "@/core/citations/sources";
+import { writeTextToClipboard } from "@/core/clipboard";
 import { useI18n } from "@/core/i18n/hooks";
-import { installSkill } from "@/core/skills/api";
-import { streamdownPlugins } from "@/core/streamdown";
-import { checkCodeFile, getFileName } from "@/core/utils/files";
+import { findToolCallResult } from "@/core/messages/utils";
+import { installSkill, SkillRequestError } from "@/core/skills/api";
+import { SafeStreamdown } from "@/core/streamdown/components";
+import {
+  canBrowserPreviewFile,
+  checkCodeFile,
+  getFileExtensionDisplayName,
+  getFileIcon,
+  getFileName,
+} from "@/core/utils/files";
 import { env } from "@/env";
 import { cn, copyText } from "@/lib/utils";
 
 import { ArtifactLink } from "../citations/artifact-link";
+import { CitationSourcesPanel } from "../citations/citation-sources-panel";
 import { useThread } from "../messages/context";
 import { Tooltip } from "../tooltip";
 
 import { useArtifacts } from "./context";
+import { artifactMarkdownPlugins } from "./markdown-preview-plugins";
+
+const WRITE_FILE_PREVIEW_REFRESH_INTERVAL_MS = 3000;
 
 export function ArtifactFileDetail({
   className,
@@ -64,7 +85,10 @@ export function ArtifactFileDetail({
   threadId: string;
 }) {
   const { t } = useI18n();
+  const { user } = useAuth();
+  const isAdmin = user?.system_role === "admin";
   const { artifacts, setOpen, select } = useArtifacts();
+  const { thread, isMock } = useThread();
   const isWriteFile = useMemo(() => {
     return filepathFromProps.startsWith("write-file:");
   }, [filepathFromProps]);
@@ -75,6 +99,41 @@ export function ArtifactFileDetail({
     }
     return filepathFromProps;
   }, [filepathFromProps, isWriteFile]);
+  // Keep these local because ChatBox replaces context artifacts with thread state.
+  const [openedPresentedFilepaths, setOpenedPresentedFilepaths] = useState<
+    string[]
+  >(() => {
+    if (isWriteFile || artifacts.includes(filepath)) {
+      return [];
+    }
+    return [filepath];
+  });
+  useEffect(() => {
+    if (isWriteFile || artifacts.includes(filepath)) {
+      return;
+    }
+    setOpenedPresentedFilepaths((current) => {
+      if (current.includes(filepath)) {
+        return current;
+      }
+      return [...current, filepath];
+    });
+  }, [artifacts, filepath, isWriteFile]);
+  const artifactOptions = useMemo(() => {
+    if (isWriteFile) {
+      return artifacts;
+    }
+    const currentIsPresented = !artifacts.includes(filepath);
+    const presentedFilepaths =
+      currentIsPresented && !openedPresentedFilepaths.includes(filepath)
+        ? [...openedPresentedFilepaths, filepath]
+        : openedPresentedFilepaths;
+    const presentedSet = new Set(presentedFilepaths);
+    return [
+      ...presentedFilepaths,
+      ...artifacts.filter((artifact) => !presentedSet.has(artifact)),
+    ];
+  }, [artifacts, filepath, isWriteFile, openedPresentedFilepaths]);
   const isSkillFile = useMemo(() => {
     return filepath.endsWith(".skill");
   }, [filepath]);
@@ -90,31 +149,53 @@ export function ArtifactFileDetail({
     }
     return checkCodeFile(filepath);
   }, [filepath, isWriteFile, isSkillFile]);
+  const canPreviewInBrowser = useMemo(() => {
+    return canBrowserPreviewFile(filepath);
+  }, [filepath]);
   const isSupportPreview = useMemo(() => {
     return language === "html" || language === "markdown";
   }, [language]);
-  const { content } = useArtifactContent({
+  const toolResult = (() => {
+    if (!isWriteFile) {
+      return undefined;
+    }
+    const url = new URL(filepathFromProps);
+    const toolCallId = url.searchParams.get("tool_call_id");
+    if (!toolCallId) {
+      return undefined;
+    }
+    return findToolCallResult(toolCallId, thread.messages);
+  })();
+  const artifactViewState = getArtifactViewState({
+    filepath: filepathFromProps,
+    isSupportPreview,
+    toolResult,
+  });
+  const { content, url } = useArtifactContent({
     threadId,
     filepath: filepathFromProps,
     enabled: isCodeFile && !isWriteFile,
   });
 
   const displayContent = content ?? "";
+  const isWritingFile = isWriteFile && toolResult === undefined;
+  const visibleContent = useThrottledValue(
+    displayContent,
+    isWritingFile ? WRITE_FILE_PREVIEW_REFRESH_INTERVAL_MS : 0,
+    filepathFromProps,
+  );
 
-  const [viewMode, setViewMode] = useState<"code" | "preview">("code");
+  const [viewMode, setViewMode] = useState<"code" | "preview">(
+    artifactViewState.initialViewMode,
+  );
   const [isInstalling, setIsInstalling] = useState(false);
   const [shareDialogOpen, setShareDialogOpen] = useState(false);
   const [shareLoading, setShareLoading] = useState(false);
   const [shareToken, setShareToken] = useState("");
   const shareAbortRef = useRef<AbortController | null>(null);
-  const { isMock } = useThread();
   useEffect(() => {
-    if (isSupportPreview) {
-      setViewMode("preview");
-    } else {
-      setViewMode("code");
-    }
-  }, [isSupportPreview]);
+    setViewMode(artifactViewState.initialViewMode);
+  }, [artifactViewState.initialViewMode]);
 
   const handleInstallSkill = useCallback(async () => {
     if (isInstalling) return;
@@ -132,11 +213,15 @@ export function ArtifactFileDetail({
       }
     } catch (error) {
       console.error("Failed to install skill:", error);
-      toast.error("Failed to install skill");
+      if (error instanceof SkillRequestError && error.isAdminRequired) {
+        toast.error(t.settings.skills.installAdminRequired);
+      } else {
+        toast.error("Failed to install skill");
+      }
     } finally {
       setIsInstalling(false);
     }
-  }, [threadId, filepath, isInstalling]);
+  }, [threadId, filepath, isInstalling, t]);
 
   const handleShare = useCallback(async () => {
     if (shareLoading) return;
@@ -181,9 +266,9 @@ export function ArtifactFileDetail({
                 </SelectTrigger>
                 <SelectContent className="select-none">
                   <SelectGroup>
-                    {(artifacts ?? []).map((filepath) => (
-                      <SelectItem key={filepath} value={filepath}>
-                        {getFileName(filepath)}
+                    {artifactOptions.map((option) => (
+                      <SelectItem key={option} value={option}>
+                        {getFileName(option)}
                       </SelectItem>
                     ))}
                   </SelectGroup>
@@ -193,7 +278,7 @@ export function ArtifactFileDetail({
           </ArtifactTitle>
         </div>
         <div className="flex min-w-0 grow items-center justify-center">
-          {isSupportPreview && (
+          {artifactViewState.canPreview && (
             <ToggleGroup
               className="mx-auto"
               type="single"
@@ -217,7 +302,7 @@ export function ArtifactFileDetail({
         </div>
         <div className="flex items-center gap-2">
           <ArtifactActions>
-            {!isWriteFile && filepath.endsWith(".skill") && (
+            {!isWriteFile && filepath.endsWith(".skill") && isAdmin && (
               <Tooltip content={t.toolCalls.skillInstallTooltip}>
                 <ArtifactAction
                   icon={isInstalling ? LoaderIcon : PackageIcon}
@@ -260,14 +345,20 @@ export function ArtifactFileDetail({
                 icon={CopyIcon}
                 label={t.clipboard.copyToClipboard}
                 disabled={!content}
-                onClick={async () => {
-                  const ok = await copyText(displayContent ?? "");
-                  if (ok) {
+                onClick={() => {
+                  void (async () => {
+                    const didCopy = await writeTextToClipboard(
+                      visibleContent ?? "",
+                    );
+                    if (!didCopy) {
+                      toast.error(t.clipboard.failedToCopyToClipboard);
+                      return;
+                    }
+
                     toast.success(t.clipboard.copiedToClipboard);
-                  } else {
+                  })().catch(() => {
                     toast.error(t.clipboard.failedToCopyToClipboard);
-                    console.error("copy to clipboard failed");
-                  }
+                  });
                 }}
                 tooltip={t.clipboard.copyToClipboard}
               />
@@ -302,25 +393,34 @@ export function ArtifactFileDetail({
         </div>
       </ArtifactHeader>
       <ArtifactContent className="p-0">
-        {isSupportPreview &&
+        {artifactViewState.canPreview &&
           viewMode === "preview" &&
           (language === "markdown" || language === "html") && (
             <ArtifactFilePreview
-              content={displayContent}
+              content={visibleContent}
               language={language ?? "text"}
+              scrollKey={filepathFromProps}
+              url={url}
             />
           )}
         {isCodeFile && viewMode === "code" && (
           <CodeEditor
             className="size-full resize-none rounded-none border-none"
-            value={displayContent ?? ""}
+            value={visibleContent ?? ""}
             readonly
           />
         )}
-        {!isCodeFile && (
+        {!isCodeFile && canPreviewInBrowser && (
           <iframe
             className="size-full"
             src={urlOfArtifact({ filepath, threadId, isMock })}
+          />
+        )}
+        {!isCodeFile && !canPreviewInBrowser && (
+          <ArtifactDownloadFallback
+            filepath={filepath}
+            threadId={threadId}
+            isMock={isMock}
           />
         )}
       </ArtifactContent>
@@ -336,7 +436,7 @@ export function ArtifactFileDetail({
           <div className="flex flex-col gap-3 max-h-[60vh] overflow-y-auto pr-1">
             {shareToken && (
               <ShareLinkRow
-                label="查看页面（无需登录）"
+                label="查看页面（无需登录�
                 value={`${getBackendBaseURL()}/share/${shareToken}`}
                 href={`${getBackendBaseURL()}/share/${shareToken}`}
                 onCopy={t.clipboard.copiedToClipboard}
@@ -374,14 +474,117 @@ export function ArtifactFileDetail({
   );
 }
 
+function ArtifactDownloadFallback({
+  filepath,
+  threadId,
+  isMock,
+}: {
+  filepath: string;
+  threadId: string;
+  isMock?: boolean;
+}) {
+  const filename = getFileName(filepath);
+  const fileType = getFileExtensionDisplayName(filepath);
+
+  return (
+    <div className="flex size-full items-center justify-center p-6">
+      <div className="flex max-w-sm flex-col items-center gap-4 text-center">
+        <div className="text-muted-foreground">
+          {getFileIcon(filepath, "size-12")}
+        </div>
+        <div className="space-y-1">
+          <div className="font-medium break-all">{filename}</div>
+          <div className="text-muted-foreground text-sm">{fileType} file</div>
+        </div>
+        <p className="text-muted-foreground text-sm">
+          This file type cannot be previewed in the browser.
+        </p>
+        <Button asChild>
+          <a
+            href={urlOfArtifact({
+              filepath,
+              threadId,
+              download: true,
+              isMock,
+            })}
+            target="_blank"
+            rel="noopener noreferrer"
+          >
+            <DownloadIcon className="size-4" />
+            Download
+          </a>
+        </Button>
+      </div>
+    </div>
+  );
+}
+
 export function ArtifactFilePreview({
   content,
   language,
+  scrollKey,
+  url,
 }: {
   content: string;
   language: string;
+  scrollKey: string;
+  url?: string;
 }) {
+  const iframeRef = useRef<HTMLIFrameElement>(null);
+  const scrollPositionRef = useRef({ x: 0, y: 0 });
+  const scrollMessageKey = useMemo(
+    () => createHtmlPreviewScrollKey(scrollKey),
+    [scrollKey],
+  );
   const [htmlPreviewUrl, setHtmlPreviewUrl] = useState<string>();
+  const citationSources = useMemo(
+    () =>
+      language === "markdown" ? extractCitationSources(content ?? "") : [],
+    [content, language],
+  );
+
+  useEffect(() => {
+    scrollPositionRef.current = { x: 0, y: 0 };
+  }, [scrollMessageKey]);
+
+  useEffect(() => {
+    if (language !== "html") {
+      return;
+    }
+
+    const handleMessage = (event: MessageEvent) => {
+      if (event.source !== iframeRef.current?.contentWindow) {
+        return;
+      }
+      if (!isArtifactScrollMessage(event.data, scrollMessageKey)) {
+        return;
+      }
+
+      if (event.data.type === "save") {
+        const x = scrollCoordinate(event.data.x);
+        const y = scrollCoordinate(event.data.y);
+        if (x !== undefined && y !== undefined) {
+          scrollPositionRef.current = { x, y };
+        }
+        return;
+      }
+
+      iframeRef.current?.contentWindow?.postMessage(
+        {
+          source: HTML_PREVIEW_SCROLL_MESSAGE_SOURCE,
+          key: scrollMessageKey,
+          type: "restore",
+          ...scrollPositionRef.current,
+        },
+        "*",
+      );
+    };
+
+    window.addEventListener("message", handleMessage);
+    return () => {
+      window.removeEventListener("message", handleMessage);
+    };
+  }, [language, scrollMessageKey]);
 
   useEffect(() => {
     if (language !== "html") {
@@ -389,31 +592,39 @@ export function ArtifactFilePreview({
       return;
     }
 
-    const blob = new Blob([content ?? ""], { type: "text/html" });
-    const url = URL.createObjectURL(blob);
-    setHtmlPreviewUrl(url);
+    const previewContent = appendHtmlPreviewScrollRestoration(
+      appendHtmlPreviewBaseHref(content ?? "", url),
+      scrollKey,
+    );
+    const blob = new Blob([previewContent], {
+      type: "text/html;charset=utf-8",
+    });
+    const objectUrl = URL.createObjectURL(blob);
+    setHtmlPreviewUrl(objectUrl);
 
     return () => {
-      URL.revokeObjectURL(url);
+      URL.revokeObjectURL(objectUrl);
     };
-  }, [content, language]);
+  }, [content, language, scrollKey, url]);
 
   if (language === "markdown") {
     return (
-      <div className="size-full px-4">
-        <Streamdown
-          className="size-full"
-          {...streamdownPlugins}
+      <div className="size-full overflow-auto px-4 py-3">
+        <SafeStreamdown
+          className="min-w-0"
+          {...artifactMarkdownPlugins}
           components={{ a: ArtifactLink }}
         >
           {content ?? ""}
-        </Streamdown>
+        </SafeStreamdown>
+        <CitationSourcesPanel sources={citationSources} className="mb-4" />
       </div>
     );
   }
   if (language === "html") {
     return (
       <iframe
+        ref={iframeRef}
         className="size-full"
         title="Artifact preview"
         sandbox="allow-scripts allow-forms"
@@ -447,7 +658,7 @@ function ShareLinkRow({
       // HTTP / restricted contexts may block every automatic copy path.
       // Fall back to a prompt so the user can still copy manually.
       toast.error("自动复制失败，请手动复制");
-      window.prompt("请手动复制下方链接", value);
+      window.prompt("请手动复制下方链�, value);
     }
   };
 
@@ -475,7 +686,7 @@ function ShareLinkRow({
           className="text-muted-foreground hover:text-foreground shrink-0 transition-colors"
         >
           {copied ? (
-            <span className="text-xs text-green-500">已复制</span>
+            <span className="text-xs text-green-500">已复�/span>
           ) : (
             <CopyIcon className="size-4" />
           )}
@@ -483,4 +694,99 @@ function ShareLinkRow({
       </div>
     </div>
   );
+function isArtifactScrollMessage(
+  data: unknown,
+  key: string,
+): data is {
+  type: "save" | "restore-request";
+  x?: unknown;
+  y?: unknown;
+} {
+  return (
+    typeof data === "object" &&
+    data !== null &&
+    "source" in data &&
+    data.source === HTML_PREVIEW_SCROLL_MESSAGE_SOURCE &&
+    "key" in data &&
+    data.key === key &&
+    "type" in data &&
+    (data.type === "save" || data.type === "restore-request")
+  );
+}
+
+function scrollCoordinate(value: unknown) {
+  return typeof value === "number" && Number.isFinite(value)
+    ? value
+    : undefined;
+}
+
+function useThrottledValue(
+  value: string,
+  intervalMs: number,
+  resetKey: string,
+) {
+  const [throttledValue, setThrottledValue] = useState(value);
+  const latestValueRef = useRef(value);
+  const lastFlushAtRef = useRef(0);
+  const timeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const resetKeyRef = useRef(resetKey);
+
+  useEffect(() => {
+    latestValueRef.current = value;
+
+    if (resetKeyRef.current !== resetKey) {
+      resetKeyRef.current = resetKey;
+      if (timeoutRef.current) {
+        clearTimeout(timeoutRef.current);
+        timeoutRef.current = null;
+      }
+      lastFlushAtRef.current = Date.now();
+      setThrottledValue(value);
+      return;
+    }
+
+    if (intervalMs <= 0) {
+      if (timeoutRef.current) {
+        clearTimeout(timeoutRef.current);
+        timeoutRef.current = null;
+      }
+      lastFlushAtRef.current = Date.now();
+      setThrottledValue(value);
+      return;
+    }
+
+    const now = Date.now();
+    const elapsed = now - lastFlushAtRef.current;
+    if (lastFlushAtRef.current === 0 || elapsed >= intervalMs) {
+      if (timeoutRef.current) {
+        clearTimeout(timeoutRef.current);
+        timeoutRef.current = null;
+      }
+      lastFlushAtRef.current = now;
+      setThrottledValue(value);
+      return;
+    }
+
+    if (timeoutRef.current) {
+      return;
+    }
+
+    timeoutRef.current = setTimeout(() => {
+      timeoutRef.current = null;
+      lastFlushAtRef.current = Date.now();
+      setThrottledValue(latestValueRef.current);
+    }, intervalMs - elapsed);
+  }, [intervalMs, resetKey, value]);
+
+  useEffect(() => {
+    return () => {
+      if (timeoutRef.current) {
+        clearTimeout(timeoutRef.current);
+      }
+    };
+  }, []);
+
+  return intervalMs <= 0 || resetKeyRef.current !== resetKey
+    ? value
+    : throttledValue;
 }
