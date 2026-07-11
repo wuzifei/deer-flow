@@ -8,7 +8,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from app.gateway.auth_middleware import AuthMiddleware
 from app.gateway.config import get_gateway_config
-from app.gateway.csrf_middleware import CSRFMiddleware, get_configured_cors_origins
+from app.gateway.csrf_middleware import CSRFMiddleware, cors_allows_all, get_configured_cors_origins
 from app.gateway.deps import langgraph_runtime
 from app.gateway.routers import (
     agents,
@@ -313,16 +313,29 @@ This gateway provides runtime endpoints for agent runs plus custom endpoints for
 
     # CORS: the unified nginx endpoint is same-origin by default. Split-origin
     # browser clients must opt in with this explicit Gateway allowlist so CORS
-    # and CSRF origin checks share the same source of truth.
-    cors_origins = sorted(get_configured_cors_origins())
-    if cors_origins:
+    # and CSRF origin checks share the same source of truth. When
+    # GATEWAY_CORS_ORIGINS contains '*', allow any origin (tunnel/frpc mode
+    # where the public origin is not known ahead of time); allow_origin_regex
+    # is used so Access-Control-Allow-Origin echoes the request origin and
+    # stays compatible with allow_credentials=True.
+    if cors_allows_all():
         app.add_middleware(
             CORSMiddleware,
-            allow_origins=cors_origins,
+            allow_origin_regex=".*",
             allow_credentials=True,
             allow_methods=["*"],
             allow_headers=["*"],
         )
+    else:
+        cors_origins = sorted(get_configured_cors_origins())
+        if cors_origins:
+            app.add_middleware(
+                CORSMiddleware,
+                allow_origins=cors_origins,
+                allow_credentials=True,
+                allow_methods=["*"],
+                allow_headers=["*"],
+            )
 
     # Include routers
     # Models API is mounted at /api/models

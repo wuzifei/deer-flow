@@ -61,7 +61,7 @@ def _build_content_disposition(disposition_type: str, filename: str) -> str:
     return f"{disposition_type}; filename*=UTF-8''{quote(filename)}"
 
 
-@router.post("/", response_model=ShareResponse, summary="创建分享链接")
+@router.post("", response_model=ShareResponse, summary="创建分享链接")
 async def create_share(body: ShareRequest, request: Request) -> ShareResponse:
     """为指定 artifact 创建公开分享链接（需认证 + thread 所有者）"""
     from app.gateway.deps import get_thread_store
@@ -167,3 +167,40 @@ async def access_shared(share_token: str) -> Response:
         media_type=mime_type or "application/octet-stream",
         headers={"Content-Disposition": _build_content_disposition("inline", actual_path.name)},
     )
+
+
+@router.get("/{share_token}/info", summary="获取分享文件元信息")
+async def share_info(share_token: str) -> dict:
+    """无需鉴权，返回分享文件的文件名与 MIME 类型，供前端查看页面渲染预览"""
+    import mimetypes
+
+    shares = _load_shares()
+    info = shares.get(share_token)
+    if not info:
+        raise HTTPException(status_code=404, detail="分享链接不存在")
+
+    # 过期检查
+    if info.get("expires_at"):
+        expires = datetime.fromisoformat(info["expires_at"])
+        if datetime.now(timezone.utc) > expires:
+            raise HTTPException(status_code=410, detail="分享链接已过期")
+
+    # 解析文件路径
+    try:
+        paths = get_paths()
+        user_id = info.get("user_id")
+        actual_path = paths.resolve_virtual_path(
+            info["thread_id"], info["artifact_path"], user_id=user_id
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    if not actual_path.exists() or not actual_path.is_file():
+        raise HTTPException(status_code=404, detail="文件已被删除")
+
+    mime_type, _ = mimetypes.guess_type(actual_path)
+    return {
+        "filename": actual_path.name,
+        "artifact_path": info["artifact_path"],
+        "mime_type": mime_type or "application/octet-stream",
+    }

@@ -93,6 +93,20 @@ def _normalize_origin(origin: str) -> str | None:
     return f"{scheme}://{_host_with_optional_port(parsed.hostname, port, scheme)}"
 
 
+def cors_allows_all() -> bool:
+    """True when GATEWAY_CORS_ORIGINS contains ``*`` — allow any browser origin.
+
+    Tunnel/frpc deployments publish the service under a public origin that is
+    not known ahead of time, so a fixed domain allowlist cannot be maintained.
+    When enabled, both the CORS middleware and the auth-origin check accept any
+    Origin header, so login works under arbitrary tunnel domains.
+    """
+    for raw_origin in os.environ.get("GATEWAY_CORS_ORIGINS", "").split(","):
+        if raw_origin.strip() == "*":
+            return True
+    return False
+
+
 def _configured_cors_origins() -> set[str]:
     """Return explicit configured browser origins that may call auth routes."""
     origins = set()
@@ -103,11 +117,6 @@ def _configured_cors_origins() -> set[str]:
         normalized = _normalize_origin(origin)
         if normalized:
             origins.add(normalized)
-    # OPC integration: always allow the embedded iframe origin
-    for _o in ("https://ld22956fj32.vicp.fun", "http://localhost:62400"):
-        _n = _normalize_origin(_o)
-        if _n:
-            origins.add(_n)
     return origins
 
 
@@ -178,6 +187,11 @@ def is_allowed_auth_origin(request: Request) -> bool:
     """
     origin = request.headers.get("origin")
     if not origin:
+        return True
+
+    # Tunnel mode (GATEWAY_CORS_ORIGINS=*): accept any browser origin so login
+    # works under arbitrary frpc/tunnel domains without a domain allowlist.
+    if cors_allows_all():
         return True
 
     normalized_origin = _normalize_origin(origin)

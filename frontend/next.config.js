@@ -22,7 +22,7 @@ const config = {
     defaultLocale: "en",
   },
   devIndicators: false,
-  allowedDevOrigins: ["ld22956fj32.vicp.fun"],
+  allowedDevOrigins: ["*","ld22956fj32.vicp.fun", "tfopc.dgjapp.cn"],
 };
 
 export default withNextra(config);

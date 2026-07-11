@@ -46,7 +46,7 @@ import { installSkill } from "@/core/skills/api";
 import { streamdownPlugins } from "@/core/streamdown";
 import { checkCodeFile, getFileName } from "@/core/utils/files";
 import { env } from "@/env";
-import { cn } from "@/lib/utils";
+import { cn, copyText } from "@/lib/utils";
 
 import { ArtifactLink } from "../citations/artifact-link";
 import { useThread } from "../messages/context";
@@ -261,12 +261,12 @@ export function ArtifactFileDetail({
                 label={t.clipboard.copyToClipboard}
                 disabled={!content}
                 onClick={async () => {
-                  try {
-                    await navigator.clipboard.writeText(displayContent ?? "");
+                  const ok = await copyText(displayContent ?? "");
+                  if (ok) {
                     toast.success(t.clipboard.copiedToClipboard);
-                  } catch (error) {
-                    toast.error("Failed to copy to clipboard");
-                    console.error(error);
+                  } else {
+                    toast.error(t.clipboard.failedToCopyToClipboard);
+                    console.error("copy to clipboard failed");
                   }
                 }}
                 tooltip={t.clipboard.copyToClipboard}
@@ -333,7 +333,15 @@ export function ArtifactFileDetail({
               分享链接
             </DialogDescription>
           </DialogHeader>
-          <div className="flex flex-col gap-3">
+          <div className="flex flex-col gap-3 max-h-[60vh] overflow-y-auto pr-1">
+            {shareToken && (
+              <ShareLinkRow
+                label="查看页面（无需登录）"
+                value={`${getBackendBaseURL()}/share/${shareToken}`}
+                href={`${getBackendBaseURL()}/share/${shareToken}`}
+                onCopy={t.clipboard.copiedToClipboard}
+              />
+            )}
             <ShareLinkRow
               label="相对路径"
               value={shareToken ? `${getBackendBaseURL()}/api/share/${shareToken}`.replace(/^https?:\/\/[^/]+/, "") : ""}
@@ -420,21 +428,26 @@ function ShareLinkRow({
   label,
   value,
   onCopy,
+  href,
 }: {
   label: string;
   value: string;
   onCopy: string;
+  href?: string;
 }) {
   const [copied, setCopied] = useState(false);
 
   const handleCopy = async () => {
-    try {
-      await navigator.clipboard.writeText(value);
+    const ok = await copyText(value);
+    if (ok) {
       setCopied(true);
       toast.success(onCopy);
       setTimeout(() => setCopied(false), 2000);
-    } catch {
-      toast.error("复制失败");
+    } else {
+      // HTTP / restricted contexts may block every automatic copy path.
+      // Fall back to a prompt so the user can still copy manually.
+      toast.error("自动复制失败，请手动复制");
+      window.prompt("请手动复制下方链接", value);
     }
   };
 
@@ -442,9 +455,20 @@ function ShareLinkRow({
     <div className="flex flex-col gap-1">
       <span className="text-muted-foreground text-xs">{label}</span>
       <div className="flex items-center gap-2">
-        <code className="bg-muted min-w-0 flex-1 overflow-hidden break-all rounded px-2 py-1.5 text-xs">
-          {value}
-        </code>
+        {href ? (
+          <a
+            href={href}
+            target="_blank"
+            rel="noopener noreferrer"
+            className="text-primary hover:no-underline min-w-0 flex-1 truncate text-xs underline underline-offset-2"
+          >
+            {value}
+          </a>
+        ) : (
+          <code className="bg-muted min-w-0 flex-1 truncate rounded px-2 py-1.5 text-xs">
+            {value}
+          </code>
+        )}
         <button
           type="button"
           onClick={handleCopy}
