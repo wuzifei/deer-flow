@@ -60,7 +60,7 @@ export default function ChatPage() {
   const router = useRouter();
   const { threadId, setThreadId, isNewThread, setIsNewThread, isMock } =
     useThreadChat();
-  // `isNewThread` tracks whether the backend has the thread yet â€gates the
+  // `isNewThread` tracks whether the backend has the thread yet â€”gates the
   // SDK's history fetch (see issue #2746).  `isWelcomeMode` is the visual
   // welcome layout (centered input, hero, quick actions); we flip it to false
   // the moment the user submits so the UI animates immediately, even though
@@ -88,7 +88,7 @@ export default function ChatPage() {
 
   // Keep welcome layout in sync when navigating between threads (sidebar
   // clicks, "new chat" button).  Submitting in /chats/new flips the layout
-  // via onSend below â€`isNewThread` stays true until onStart, so this effect
+  // via onSend below â€”`isNewThread` stays true until onStart, so this effect
   // is harmless during the submit transition.
   useEffect(() => {
     setIsWelcomeMode(isNewThread);
@@ -112,7 +112,7 @@ export default function ChatPage() {
     displayThreadId: threadId,
     context: settings.context,
     isMock,
-    // onSend only animates the UI; do NOT flip `isNewThread` here â€the
+    // onSend only animates the UI; do NOT flip `isNewThread` here â€”the
     // LangGraph SDK eagerly fetches /history the moment it receives a
     // thread id and assumes the thread exists on the backend (issue #2746).
     onSend: () => {

@@ -385,7 +385,7 @@ export function mergeMessages(
 
   // The overlap is a contiguous suffix of historyMessages (newest history == oldest thread).
   // Scan from the end: shrink cutoff while messages are already in thread, stop as soon as
-  // we hit one that isn't â€everything before that point is non-overlapping.
+  // we hit one that isn't â€”everything before that point is non-overlapping.
   let cutoff = historyMessages.length;
   for (let i = historyMessages.length - 1; i >= 0; i--) {
     const msg = historyMessages[i];
@@ -469,7 +469,7 @@ export function computeSummarizationMovedMessages(
  * messages into history through an async `setState`. The live thread messages
  * are owned by the LangGraph SDK external store while the archived history is
  * React state, so a render can observe the post-summary (shrunk) thread before
- * the archive `setState` commits â€leaving the rescued messages in neither
+ * the archive `setState` commits â€”leaving the rescued messages in neither
  * merge input. Reading them from a synchronous buffer here keeps the merge
  * correct at every render regardless of how the two state channels interleave.
  *
@@ -506,7 +506,7 @@ export function resolvePreservedHistory(
 /**
  * Drop the archive-buffer entries that the canonical history state has already
  * absorbed. This keeps the buffer a transient bridge across the async gap
- * rather than a second long-lived source of truth â€otherwise a stale copy
+ * rather than a second long-lived source of truth â€”otherwise a stale copy
  * could resurrect a message that history later filtered out (e.g. a superseded
  * or regenerated run).
  */
@@ -2047,7 +2047,7 @@ async function deleteLocalThreadData(threadId: string) {
     },
   );
 
-  // A 404 means the thread is already gone â€the desired end state. The prior
+  // A 404 means the thread is already gone â€”the desired end state. The prior
   // `apiClient.threads.delete` call hits the same gateway handler (nginx
   // rewrites /api/langgraph/threads/* to /api/threads/*) and removes the
   // thread_meta row, so this second delete's ownership guard 404s. Treat it as

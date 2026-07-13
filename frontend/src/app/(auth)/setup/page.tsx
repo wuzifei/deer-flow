@@ -47,7 +47,7 @@ export default function SetupPage() {
           if (data.needs_setup) {
             setMode("init_admin");
           } else {
-            // System already set up and user is not logged in â€go to login
+            // System already set up and user is not logged in â€”go to login
             router.replace("/login");
           }
         })
@@ -55,7 +55,7 @@ export default function SetupPage() {
           if (!cancelled) router.replace("/login");
         });
     } else {
-      // Authenticated but needs_setup is false â€already set up
+      // Authenticated but needs_setup is false â€”already set up
       router.replace("/workspace");
     }
 
@@ -155,7 +155,7 @@ export default function SetupPage() {
   if (mode === "loading") {
     return (
       <div className="flex min-h-screen items-center justify-center">
-        <p className="text-muted-foreground text-sm">Loadingâ€/p>
+        <p className="text-muted-foreground text-sm">Loadingâ€”/p>
       </div>
     );
   }
@@ -224,7 +224,7 @@ export default function SetupPage() {
             </div>
             {error && <p className="ms-1 text-sm text-red-500">{error}</p>}
             <Button type="submit" className="w-full" disabled={loading}>
-              {loading ? "Creating accountâ€ : "Create Admin Account"}
+              {loading ? "Creating accountâ€” : "Create Admin Account"}
             </Button>
           </form>
         </div>
@@ -286,7 +286,7 @@ export default function SetupPage() {
           />
           {error && <p className="text-sm text-red-500">{error}</p>}
           <Button type="submit" className="w-full" disabled={loading}>
-            {loading ? "Setting upâ€ : "Complete Setup"}
+            {loading ? "Setting upâ€” : "Complete Setup"}
           </Button>
         </form>
       </div>

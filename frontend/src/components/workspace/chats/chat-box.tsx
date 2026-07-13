@@ -35,7 +35,6 @@ const ChatBox: React.FC<{ children: React.ReactNode; threadId: string }> = ({
   const isMobile = useIsMobile();
   const pathname = usePathname();
   const threadIdRef = useRef(threadId);
-  const isMobile = useIsMobile();
 
   const {
     artifacts,

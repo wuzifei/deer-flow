@@ -179,14 +179,14 @@ export default function LoginPage() {
         const authError = parseAuthError(data);
         setError(authError.message);
         // On a failed login with SSO configured, surface a hint pointing at the
-        // SSO buttons â€the "wrong password" may really mean "this is an SSO account".
+        // SSO buttons â€”the "wrong password" may really mean "this is an SSO account".
         if (isLogin && ssoProviders.length > 0) {
           setShowSsoHint(true);
         }
         return;
       }
 
-      // Both login and register set a cookie â€redirect to workspace
+      // Both login and register set a cookie â€”redirect to workspace
       router.push(redirectPath);
     } catch {
       setError(t.login.networkError);

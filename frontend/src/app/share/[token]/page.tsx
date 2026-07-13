@@ -122,7 +122,11 @@ export default function ShareViewPage() {
         </header>
         <div className="min-h-0 flex-1">
           {isSupportPreview && viewMode === "preview" && language ? (
-            <ArtifactFilePreview content={content} language={language} />
+            <ArtifactFilePreview
+              content={content}
+              language={language}
+              scrollKey={token ?? "share"}
+            />
           ) : isCodeFile ? (
             <CodeEditor
               className="size-full resize-none rounded-none border-none"

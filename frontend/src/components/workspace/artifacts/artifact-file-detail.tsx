@@ -436,7 +436,7 @@ export function ArtifactFileDetail({
           <div className="flex flex-col gap-3 max-h-[60vh] overflow-y-auto pr-1">
             {shareToken && (
               <ShareLinkRow
-                label="查看页面（无需登录�
+                label="查看页面（无需登录）"
                 value={`${getBackendBaseURL()}/share/${shareToken}`}
                 href={`${getBackendBaseURL()}/share/${shareToken}`}
                 onCopy={t.clipboard.copiedToClipboard}
@@ -658,7 +658,7 @@ function ShareLinkRow({
       // HTTP / restricted contexts may block every automatic copy path.
       // Fall back to a prompt so the user can still copy manually.
       toast.error("自动复制失败，请手动复制");
-      window.prompt("请手动复制下方链�, value);
+      window.prompt("请手动复制下方链接", value);
     }
   };
 
@@ -686,7 +686,7 @@ function ShareLinkRow({
           className="text-muted-foreground hover:text-foreground shrink-0 transition-colors"
         >
           {copied ? (
-            <span className="text-xs text-green-500">已复�/span>
+            <span className="text-xs text-green-500">已复制</span>
           ) : (
             <CopyIcon className="size-4" />
           )}
@@ -694,6 +694,8 @@ function ShareLinkRow({
       </div>
     </div>
   );
+}
+
 function isArtifactScrollMessage(
   data: unknown,
   key: string,

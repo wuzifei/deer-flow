@@ -45,7 +45,7 @@ router = APIRouter(prefix="/api/v1/auth", tags=["auth"])
 
 
 class LoginResponse(BaseModel):
-    """Response model for login �token only lives in HttpOnly cookie."""
+    """Response model for login —token only lives in HttpOnly cookie."""
 
     expires_in: int  # seconds
     needs_setup: bool = False
@@ -102,7 +102,7 @@ def _password_is_common(password: str) -> bool:
 
     Lowercases the input so trivial mutations like ``Password`` /
     ``PASSWORD`` are also rejected. Does not normalize digit substitutions
-    (``p@ssw0rd`` is included as a literal entry instead) �keeping the
+    (``p@ssw0rd`` is included as a literal entry instead) —keeping the
     rule cheap and predictable.
     """
     return password.lower() in _COMMON_PASSWORDS
@@ -164,7 +164,7 @@ def _set_session_cookie(response: Response, token: str, request: Request) -> Non
 
 
 # ── Rate Limiting ────────────────────────────────────────────────────────
-# In-process dict �not shared across workers.
+# In-process dict —not shared across workers.
 #
 # **Limitation**: with multi-worker deployments (e.g., gunicorn -w N), each
 # worker maintains its own lockout table, so an attacker effectively gets
@@ -175,7 +175,7 @@ def _set_session_cookie(response: Response, token: str, request: Request) -> Non
 _MAX_LOGIN_ATTEMPTS = 5
 _LOCKOUT_SECONDS = 300  # 5 minutes
 
-# ip �(fail_count, lock_until_timestamp)
+# ip →(fail_count, lock_until_timestamp)
 _login_attempts: dict[str, tuple[int, float]] = {}
 
 
@@ -208,15 +208,15 @@ def _get_client_ip(request: Request) -> str:
     Trust model:
 
     - The TCP peer (``request.client.host``) is always the baseline. It is
-      whatever the kernel reports as the connecting socket �unforgeable
+      whatever the kernel reports as the connecting socket —unforgeable
       by the client itself.
     - ``X-Real-IP`` is **only** honored if the TCP peer is in the
       ``AUTH_TRUSTED_PROXIES`` allowlist (set via env var, comma-separated
       CIDR or single IPs). When set, the gateway is assumed to be behind a
-      reverse proxy (nginx, Cloudflare, ALB, � that overwrites
+      reverse proxy (nginx, Cloudflare, ALB, — that overwrites
       ``X-Real-IP`` with the original client address.
     - With no ``AUTH_TRUSTED_PROXIES`` set, ``X-Real-IP`` is silently
-      ignored �closing the bypass where any client could rotate the
+      ignored —closing the bypass where any client could rotate the
       header to dodge per-IP rate limits in dev / direct-gateway mode.
 
     ``X-Forwarded-For`` is intentionally NOT used because it is naturally
@@ -234,7 +234,7 @@ def _get_client_ip(request: Request) -> str:
                 if real_ip:
                     return real_ip
         except ValueError:
-            # peer_host wasn't a parseable IP (e.g. "unknown") �fall through
+            # peer_host wasn't a parseable IP (e.g. "unknown") —fall through
             pass
 
     return peer_host or "unknown"
@@ -416,7 +416,7 @@ async def get_me(request: Request):
     )
 
 
-# Per-IP cache: ip �(timestamp, result_dict).
+# Per-IP cache: ip →(timestamp, result_dict).
 _SETUP_STATUS_COOLDOWN_SECONDS = 1
 # Returns the cached result within the TTL instead of 429, because
 # the answer (whether an admin exists) rarely changes and returning
@@ -432,7 +432,7 @@ _SETUP_STATUS_INFLIGHT_GUARD = asyncio.Lock()
 async def setup_status(request: Request):
     """Check if an admin account exists. Returns needs_setup=True when no admin exists."""
 
-    # Return cached result when within TTL �avoids 429 on multi-tab reconnection.
+    # Return cached result when within TTL —avoids 429 on multi-tab reconnection.
     cached = _SETUP_STATUS_CACHE.get(client_ip)
     if cached is not None:
         cached_time, cached_result = cached
@@ -588,7 +588,7 @@ def _resolve_oidc_redirect_uri(request: Request, provider_id: str, provider_conf
 async def list_auth_providers():
     """List enabled SSO providers for the login page.
 
-    Returns only safe frontend metadata �no secrets, endpoints, or
+    Returns only safe frontend metadata —no secrets, endpoints, or
     internal configuration.
     """
     from deerflow.config.app_config import get_app_config
@@ -615,7 +615,7 @@ async def list_auth_providers():
 async def oauth_login(
     request: Request,
     provider: str,
-    next: str | None = None,  # noqa: A002 (shadowing built-in is intentional �this is the query param name)
+    next: str | None = None,  # noqa: A002 (shadowing built-in is intentional —this is the query param name)
 ):
     """Initiate OIDC login flow.
 

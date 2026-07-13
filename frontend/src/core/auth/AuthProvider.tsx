@@ -99,7 +99,7 @@ export function AuthProvider({ children, initialUser }: AuthProviderProps) {
    * Logout - call FastAPI logout endpoint and clear local state
    * Per RFC-001: Immediately clear local state, don't wait for server confirmation
    *
-   * When the gateway is unreachable the fetch silently fails â€the SPA
+   * When the gateway is unreachable the fetch silently fails â€”the SPA
    * router.push("/") would leave the user on "/" still holding stale
    * React state and any in-flight SSE / fetch / query subscriptions.
    * We therefore fall back to a hard navigation (window.location.href),

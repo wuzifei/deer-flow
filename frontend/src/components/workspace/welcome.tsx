@@ -46,7 +46,7 @@ export function Welcome({
     >
       <div className="max-w-full text-2xl font-bold">
         {searchParams.get("mode") === "skill" ? (
-          `�${t.welcome.createYourOwnSkill} ✨`
+          `✨ ${t.welcome.createYourOwnSkill} ✨`
         ) : (
           <div className="flex max-w-full flex-wrap items-center justify-center gap-2">
             <div className={cn("inline-block", !waved ? "animate-wave" : "")}>

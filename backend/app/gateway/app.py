@@ -63,7 +63,7 @@ async def _ensure_admin_user(app: FastAPI) -> None:
 
     After admin creation, migrate orphan threads from the LangGraph
     store (metadata.user_id unset) to the admin account. This is the
-    "no-auth â†with-auth" upgrade path: users who ran DeerFlow without
+    "no-auth â†’with-auth" upgrade path: users who ran DeerFlow without
     authentication have existing LangGraph thread data that needs an
     owner assigned.
         First boot (no admin exists):
@@ -71,7 +71,7 @@ async def _ensure_admin_user(app: FastAPI) -> None:
             - The operator must visit ``/setup`` to create the first admin.
 
     Subsequent boots (admin already exists):
-      - Runs the one-time "no-auth â†with-auth" orphan thread migration for
+      - Runs the one-time "no-auth â†’with-auth" orphan thread migration for
         existing LangGraph thread metadata that has no user_id.
 
     No SQL persistence migration is needed: the four user_id columns
@@ -101,12 +101,12 @@ async def _ensure_admin_user(app: FastAPI) -> None:
 
     if admin_count == 0:
         logger.info("=" * 60)
-        logger.info("  First boot detected â€no admin account exists.")
+        logger.info("  First boot detected â€”no admin account exists.")
         logger.info("  Visit /setup to complete admin account creation.")
         logger.info("=" * 60)
         return
 
-    # Admin already exists â€run orphan thread migration for any
+    # Admin already exists â€”run orphan thread migration for any
     # LangGraph thread metadata that pre-dates the auth module.
     async with sf() as session:
         stmt = select(UserRow).where(UserRow.system_role == "admin").limit(1)
@@ -117,8 +117,8 @@ async def _ensure_admin_user(app: FastAPI) -> None:
 
     admin_id = str(row.id)
 
-    # LangGraph store orphan migration â€non-fatal.
-    # This covers the "no-auth â†with-auth" upgrade path for users
+    # LangGraph store orphan migration â€”non-fatal.
+    # This covers the "no-auth â†’with-auth" upgrade path for users
     # whose existing LangGraph thread metadata has no user_id set.
     store = getattr(app.state, "store", None)
     if store is not None:
@@ -192,10 +192,10 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
 
     # Pre-warm tiktoken encoding cache so the first memory-injection request
     # never blocks on the BPE data download (which hits an OpenAI/Azure URL
-    # that may be unreachable in restricted networks â€see issue #3402).
+    # that may be unreachable in restricted networks â€”see issue #3402).
     # When memory.token_counting is "char", token counting never touches
     # tiktoken, so skip the warm-up entirely (avoids even the 5s probe in
-    # network-restricted deployments â€see issue #3429).
+    # network-restricted deployments â€”see issue #3429).
     if startup_config.memory.token_counting == "char":
         logger.info("memory.token_counting='char'; skipping tiktoken warm-up (network-free token estimation)")
     else:
@@ -501,7 +501,7 @@ This gateway provides runtime endpoints for agent runs plus custom endpoints for
     # Fail-closed: only mount the route when a webhook secret is configured
     # (or when the explicit DEER_FLOW_ALLOW_UNVERIFIED_GITHUB_WEBHOOKS=1
     # dev opt-in is set). A misconfigured deployment without a secret cannot
-    # serve forged deliveries because the URL responds 404 â€there is no
+    # serve forged deliveries because the URL responds 404 â€”there is no
     # handler to reach.
     if github_webhooks.is_route_enabled():
         app.include_router(github_webhooks.router)

@@ -12,7 +12,8 @@ from deerflow.runtime.user_context import DEFAULT_USER_ID
 
 INTERNAL_AUTH_HEADER_NAME = "X-DeerFlow-Internal-Token"
 
-# 支持通过环境变量设置固定 token，方便跨进程（如 OPC）调�_FIXED_TOKEN = os.environ.get("DEERFLOW_INTERNAL_TOKEN", "").strip()
+# 支持通过环境变量设置固定 token，方便跨进程（如 OPC）调用
+_FIXED_TOKEN = os.environ.get("DEERFLOW_INTERNAL_TOKEN", "").strip()
 _INTERNAL_AUTH_TOKEN = _FIXED_TOKEN or secrets.token_urlsafe(32)
 INTERNAL_OWNER_USER_ID_HEADER_NAME = "X-DeerFlow-Owner-User-Id"
 INTERNAL_AUTH_ENV_VAR = "DEER_FLOW_INTERNAL_AUTH_TOKEN"

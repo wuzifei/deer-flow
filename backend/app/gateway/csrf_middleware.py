@@ -104,7 +104,7 @@ def _normalize_origin(origin: str) -> str | None:
 
 
 def cors_allows_all() -> bool:
-    """True when GATEWAY_CORS_ORIGINS contains ``*`` �allow any browser origin.
+    """True when GATEWAY_CORS_ORIGINS contains ``*`` —allow any browser origin.
 
     Tunnel/frpc deployments publish the service under a public origin that is
     not known ahead of time, so a fixed domain allowlist cannot be maintained.
@@ -227,7 +227,8 @@ class CSRFMiddleware(BaseHTTPMiddleware):
                 content={"detail": "Cross-site auth request denied."},
             )
 
-        # 豁免 internal token 认证的请求（OPC DeerFlow adapter 使用�        from app.gateway.internal_auth import INTERNAL_AUTH_HEADER_NAME, is_valid_internal_auth_token
+        # 豁免 internal token 认证的请求（OPC DeerFlow adapter 使用）
+        from app.gateway.internal_auth import INTERNAL_AUTH_HEADER_NAME, is_valid_internal_auth_token
         internal_token = request.headers.get(INTERNAL_AUTH_HEADER_NAME)
         if is_valid_internal_auth_token(internal_token):
             return await call_next(request)
@@ -236,7 +237,7 @@ class CSRFMiddleware(BaseHTTPMiddleware):
             cookie_token = request.cookies.get(CSRF_COOKIE_NAME)
             header_token = request.headers.get(CSRF_HEADER_NAME)
 
-            # Auto-renew: CSRF cookie expired but session still valid �allow through
+            # Auto-renew: CSRF cookie expired but session still valid —allow through
             if not cookie_token and request.cookies.get("access_token"):
                 pass
             elif not cookie_token or not header_token:
@@ -265,7 +266,7 @@ class CSRFMiddleware(BaseHTTPMiddleware):
                 # Match the access_token cookie's lifetime (auth.py::_set_session_cookie)
                 # so the double-submit pair never diverges. A session-only csrf_token is
                 # evicted when iOS Safari terminates a home-screen PWA while the persistent
-                # access_token survives �leaving the user "logged in" but unable to make
+                # access_token survives —leaving the user "logged in" but unable to make
                 # any state-changing request (403 "CSRF token missing").
                 #max_age=get_auth_config().token_expiry_days * 24 * 3600 if is_https else None,
                 max_age=86400 * 7,

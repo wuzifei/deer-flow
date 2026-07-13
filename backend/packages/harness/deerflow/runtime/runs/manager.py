@@ -36,7 +36,7 @@ _RETRYABLE_SQLITE_ERROR_CODES = {
 }
 
 # Driver-native unique-constraint signals. These are stable across driver and
-# SQLAlchemy versions â€message text is not (SQLite says "UNIQUE constraint
+# SQLAlchemy versions â€”message text is not (SQLite says "UNIQUE constraint
 # failed", Postgres says "duplicate key value violates unique constraint").
 _UNIQUE_PGCODE = "23505"
 _SQLITE_UNIQUE_ERRORCODE = sqlite3.SQLITE_CONSTRAINT_UNIQUE
@@ -52,8 +52,8 @@ def _is_unique_violation(exc: BaseException) -> bool:
 
     SQLAlchemy wraps the driver's IntegrityError; the wrapped driver exception is
     reachable via ``exc.orig`` (and ``__cause__`` / ``__context__``). Prefer
-    driver-native signals â€psycopg ``pgcode`` / ``sqlcode`` = "23505" and
-    sqlite3 ``sqlite_errorcode`` = ``SQLITE_CONSTRAINT_UNIQUE`` â€over message
+    driver-native signals â€”psycopg ``pgcode`` / ``sqlcode`` = "23505" and
+    sqlite3 ``sqlite_errorcode`` = ``SQLITE_CONSTRAINT_UNIQUE`` â€”over message
     matching, then fall back to message substrings for cases where the driver
     exception isn't reachable through the chain.
 
@@ -671,7 +671,7 @@ class RunManager:
 
         Sets the abort event with the action reason and cancels the asyncio task.
         Returns ``True`` if cancellation was initiated **or** the run was already
-        interrupted (idempotent â€a second cancel is a no-op success).
+        interrupted (idempotent â€”a second cancel is a no-op success).
         Returns ``False`` only when the run is unknown to this worker or has
         reached a terminal state other than interrupted (completed, failed, etc.).
         """
@@ -680,7 +680,7 @@ class RunManager:
             if record is None:
                 return False
             if record.status == RunStatus.interrupted:
-                return True  # idempotent â€already cancelled on this worker
+                return True  # idempotent â€”already cancelled on this worker
             if record.status not in (RunStatus.pending, RunStatus.running):
                 return False
             record.abort_action = action
@@ -840,7 +840,7 @@ class RunManager:
                             if is_unique and attempt + 1 < max_retries:
                                 continue
                             if is_unique:
-                                # Exhausted retries on unique violation â€surface
+                                # Exhausted retries on unique violation â€”surface
                                 # as ConflictError to match the reject branch's
                                 # contract (409, not 500). Same root cause: another
                                 # worker won the race for this thread.
@@ -850,7 +850,7 @@ class RunManager:
                     # rows as interrupted in the same transaction; no extra
                     # store write is needed for them.
 
-            # 3) Only now safe to register locally â€store insert succeeded.
+            # 3) Only now safe to register locally â€”store insert succeeded.
             self._runs[run_id] = record
             self._index_run_locked(record)
 
@@ -891,7 +891,7 @@ class RunManager:
         Worker A crashed or was partitioned. This worker (B) can safely claim
         and error it out because the lease was not renewed.
 
-        Rows with a still-valid lease are skipped â€they belong to another live
+        Rows with a still-valid lease are skipped â€”they belong to another live
         worker. Rows with a NULL lease (pre-ownership data) are reclaimed as
         well, matching the original single-worker recovery behaviour.
         """
@@ -920,7 +920,7 @@ class RunManager:
             async with self._lock:
                 live_record = self._runs.get(record.run_id)
                 if live_record is not None and live_record.status in (RunStatus.pending, RunStatus.running):
-                    # Still owned by a local task â€skip
+                    # Still owned by a local task â€”skip
                     continue
 
             record.status = RunStatus.error
@@ -1010,7 +1010,7 @@ class RunManager:
         without waiting for a pod restart.
 
         Both operations are guarded so a transient failure cannot take the
-        heartbeat task down â€a dead heartbeat means no lease is renewed
+        heartbeat task down â€”a dead heartbeat means no lease is renewed
         again, and every active run eventually looks orphaned to peers.
         """
         if self._run_ownership_config is None or self._heartbeat_stop is None:
@@ -1036,7 +1036,7 @@ class RunManager:
             # Reconcile every 3rd cycle (= every lease_seconds). Startup
             # reconciliation (in langgraph_runtime) covers the initial
             # sweep; this periodic pass catches orphans whose lease
-            # expires between restarts â€e.g. Worker A crashes, its
+            # expires between restarts â€”e.g. Worker A crashes, its
             # replacement starts before the lease expires, and the
             # startup pass skips the still-valid lease.
             if cycle % 3 == 0:
@@ -1056,7 +1056,7 @@ class RunManager:
             # Renew any pending/running run owned by this worker unless its
             # background task has already completed. A pending run whose task
             # has not been spawned yet (``task is None``) is still live from
-            # this worker's perspective â€between ``create_run_atomic``
+            # this worker's perspective â€”between ``create_run_atomic``
             # inserting the row and the worker layer spawning the agent task
             # there is a brief window. If we drop those records here and the
             # window stretches past ``lease_seconds`` (e.g. event-loop
@@ -1094,7 +1094,7 @@ class RunManager:
         reconciliation handles the initial sweep; this periodic pass
         catches orphans whose lease expires between restarts.
         """
-        error_msg = "Run lease expired â€owning worker is unreachable."
+        error_msg = "Run lease expired â€”owning worker is unreachable."
         recovered = await self.reconcile_orphaned_inflight_runs(error=error_msg)
         if recovered:
             logger.warning(
@@ -1122,11 +1122,11 @@ class RunManager:
         Draining in-flight runs *before* the checkpointer is closed lets each
         run that settles within ``timeout`` flush its final checkpoint while
         resources are still open. Only runs that do **not** settle on their own
-        are marked ``interrupted`` â€a run that completes (e.g. ``success``)
+        are marked ``interrupted`` â€”a run that completes (e.g. ``success``)
         during the drain keeps its real terminal status instead of being
         blanket-overwritten. The whole drain, including the trailing status
         persistence, is bounded by ``timeout`` so a run stuck in cleanup (or a
-        slow store under DB pressure) cannot hang worker shutdown â€the
+        slow store under DB pressure) cannot hang worker shutdown â€”the
         precondition for the signal-reentrancy deadlock guarded by
         ``app.gateway.app._SHUTDOWN_HOOK_TIMEOUT_SECONDS``. Runs still active
         after ``timeout`` are logged and may still race teardown.
@@ -1158,7 +1158,7 @@ class RunManager:
             for record in inflight:
                 task = record.task
                 if task not in pending and not task.cancelled():
-                    # Completed on its own â€retrieve any surfaced exception so it
+                    # Completed on its own â€”retrieve any surfaced exception so it
                     # is not reported as "never retrieved", and keep its status.
                     task.exception()  # type: ignore[union-attr]  # done & not cancelled
                     continue
