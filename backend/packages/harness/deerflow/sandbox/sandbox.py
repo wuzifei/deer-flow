@@ -46,6 +46,23 @@ class Sandbox(ABC):
 
     _id: str
 
+    #: Whether ``execute_command`` reuses one persistent shell session across
+    #: calls (shell state — exports, cwd, functions — survives from one call
+    #: into the next). When True, a recorded command's environment cannot be
+    #: proven clean from the command text alone, so evidence consumers (the
+    #: acceptance checklist's ``tests_passed`` matcher) must treat recorded
+    #: bash evidence as untrusted and degrade to UNVERIFIED.
+    #:
+    #: Tri-state, failing closed: ``None`` (the default) means the
+    #: implementation has NOT declared its session semantics — custom
+    #: providers are loaded by class path and may reuse a persistent
+    #: session, so silence cannot be read as fresh-shell. Consumers must
+    #: trust only an explicit ``False`` and degrade to UNVERIFIED on
+    #: ``None`` exactly as on ``True``. Every shipped implementation
+    #: declares explicitly (AIO: ``True``; the per-call exec providers:
+    #: ``False``).
+    persistent_shell_sessions: bool | None = None
+
     def __init__(self, id: str):
         self._id = id
 
@@ -91,11 +108,18 @@ class Sandbox(ABC):
         pass
 
     @abstractmethod
-    def read_file(self, path: str) -> str:
+    def read_file(
+        self,
+        path: str,
+        start_line: int | None = None,
+        end_line: int | None = None,
+    ) -> str:
         """Read the content of a file.
 
         Args:
             path: The absolute path of the file to read.
+            start_line: Optional starting line number (1-indexed, inclusive).
+            end_line: Optional ending line number (1-indexed, inclusive).
 
         Returns:
             The content of the file.
@@ -161,7 +185,7 @@ class Sandbox(ABC):
         case_sensitive: bool = False,
         max_results: int = 100,
     ) -> tuple[list[GrepMatch], bool]:
-        """Search for matches inside text files under a directory."""
+        """Search for matches inside a text file or files under a directory."""
         pass
 
     @abstractmethod

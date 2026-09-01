@@ -57,6 +57,10 @@ class BoxliteBox(Sandbox):
             per-call ``env`` (request-scoped secrets).
     """
 
+    #: Every call is a fresh ``sh -lc`` exec in the box — no shell state
+    #: survives into the next command.
+    persistent_shell_sessions = False
+
     TERMINAL_ERROR_MARKERS = (
         "vsock",
         "disconnected",
@@ -199,13 +203,20 @@ class BoxliteBox(Sandbox):
             output = f"{stdout}\n{stderr}"
         else:
             output = stdout or stderr
-        if result.exit_code not in (0, None) and not output:
-            output = f"Command exited with code {result.exit_code}"
+        if result.exit_code not in (0, None):
+            # Mirror LocalSandbox: preserve a nonzero exit in the output text
+            # even when the command produced output (see e2b_sandbox).
+            output = f"{output}\nExit Code: {result.exit_code}" if output else f"Command exited with code {result.exit_code}"
         return output if output else "(no output)"
 
     # ── file operations ─────────────────────────────────────────────────
 
-    def read_file(self, path: str) -> str:
+    def read_file(
+        self,
+        path: str,
+        start_line: int | None = None,
+        end_line: int | None = None,
+    ) -> str:
         resolved = self._resolve_path(path)
         try:
             r = self._exec("cat", "--", resolved)
@@ -214,7 +225,13 @@ class BoxliteBox(Sandbox):
             return f"Error: {e}"
         if r.exit_code not in (0, None):
             return f"Error: {(r.stderr or '').strip() or 'cannot read file'}"
-        return r.stdout or ""
+        content = r.stdout or ""
+        if start_line is None and end_line is None:
+            return content
+        lines = content.splitlines()
+        start = start_line or 1
+        end = end_line if end_line is not None else len(lines)
+        return "\n".join(lines[start - 1 : end])
 
     def write_file(self, path: str, content: str, append: bool = False) -> None:
         self._write_bytes(self._resolve_path(path), content.encode("utf-8"), append=append)
@@ -325,11 +342,11 @@ class BoxliteBox(Sandbox):
             re.compile(pattern, 0 if case_sensitive else re.IGNORECASE)
 
         resolved = self._resolve_path(path)
-        # busybox+GNU-portable flags: -r recursive (also prints the filename),
-        # -n line numbers, -I skip binary, -E/-F regex vs fixed. --include and -m
-        # are omitted for busybox portability; glob-scoping and the result cap are
-        # applied in Python below.
-        flags = ["-r", "-n", "-I"]
+        # busybox+GNU-portable flags: -r recursive, -H always print the filename
+        # (including when path is a single file), -n line numbers, -I skip
+        # binary, -E/-F regex vs fixed. --include and -m are omitted for busybox
+        # portability; glob-scoping and the result cap are applied in Python.
+        flags = ["-r", "-H", "-n", "-I"]
         if not case_sensitive:
             flags.append("-i")
         flags.append("-F" if literal else "-E")

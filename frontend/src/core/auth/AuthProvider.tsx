@@ -117,7 +117,7 @@ export function AuthProvider({ children, initialUser }: AuthProviderProps) {
 
     let logoutFailed = false;
     try {
-      const res = await fetch("${getBackendBaseURL()}/api/v1/auth/logout", {
+      const res = await fetch(`${getBackendBaseURL()}/api/v1/auth/logout`, {
         method: "POST",
         credentials: "include",
       });

@@ -8,6 +8,38 @@ from deerflow.config.token_budget_config import TokenBudgetConfig
 
 logger = logging.getLogger(__name__)
 
+DEFAULT_MAX_TOTAL_SUBAGENTS_PER_RUN = 6
+MIN_TOTAL_SUBAGENTS_PER_RUN = 1
+MAX_TOTAL_SUBAGENTS_PER_RUN = 50
+MIN_CONCURRENT_SUBAGENT_CALLS = 1
+MAX_CONCURRENT_SUBAGENT_CALLS = 64
+
+
+def clamp_subagent_concurrency(value: int, *, execution_capacity: int | None = None) -> int:
+    """Clamp task-call concurrency to both the safety ceiling and real slots."""
+    upper = MAX_CONCURRENT_SUBAGENT_CALLS
+    if execution_capacity is not None:
+        upper = min(upper, max(MIN_CONCURRENT_SUBAGENT_CALLS, execution_capacity))
+    return max(MIN_CONCURRENT_SUBAGENT_CALLS, min(upper, value))
+
+
+def effective_subagent_concurrency(
+    value: int | None,
+    app_config: object,
+    *,
+    execution_capacity: int | None = None,
+) -> int:
+    """Resolve one value for prompt, middleware, and process execution capacity."""
+    runtime = getattr(app_config, "subagent_runtime", None)
+    capacity = int(execution_capacity if execution_capacity is not None else getattr(runtime, "max_running", 3))
+    requested = capacity if value is None else int(value)
+    return clamp_subagent_concurrency(requested, execution_capacity=capacity)
+
+
+def clamp_total_subagents_per_run(value: int) -> int:
+    """Clamp per-run task delegation totals to the enforced middleware range."""
+    return max(MIN_TOTAL_SUBAGENTS_PER_RUN, min(MAX_TOTAL_SUBAGENTS_PER_RUN, value))
+
 
 def default_subagent_token_budget(*, summarization_enabled: bool = False) -> TokenBudgetConfig:
     """Default per-run token budget for subagents (#3875 Phase 2 → Phase 3 coupling).
@@ -116,6 +148,12 @@ class SubagentsAppConfig(BaseModel):
         default=None,
         ge=1,
         description="Optional default max-turn override for all subagents (None = keep builtin defaults)",
+    )
+    max_total_per_run: int = Field(
+        default=DEFAULT_MAX_TOTAL_SUBAGENTS_PER_RUN,
+        ge=MIN_TOTAL_SUBAGENTS_PER_RUN,
+        le=MAX_TOTAL_SUBAGENTS_PER_RUN,
+        description="Default total number of subagent delegations allowed in one lead-agent run. This is a deterministic backstop against repeated legal-sized task batches. Valid range: 1-50.",
     )
     token_budget: TokenBudgetConfig = Field(
         default_factory=default_subagent_token_budget,

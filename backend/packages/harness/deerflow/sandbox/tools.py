@@ -1,17 +1,26 @@
 import asyncio
 import json
 import logging
+import ntpath
 import os
 import posixpath
 import re
 import shlex
-from collections.abc import Callable
+from collections.abc import AsyncIterator, Callable, Iterator
+from contextlib import asynccontextmanager, contextmanager
+from contextvars import ContextVar
 from functools import lru_cache
 from pathlib import Path
 
 from langchain.tools import tool
 
 from deerflow.agents.thread_state import ThreadDataState
+from deerflow.authz.sandbox_authz import (
+    authorize_sandbox_execution,
+    authorize_sandbox_execution_async,
+    safe_app_config,
+    safe_app_config_async,
+)
 from deerflow.config import get_app_config
 from deerflow.config.paths import VIRTUAL_PATH_PREFIX
 from deerflow.constants import DEFAULT_SKILLS_CONTAINER_PATH
@@ -23,6 +32,8 @@ from deerflow.sandbox.exceptions import (
     SandboxRuntimeError,
 )
 from deerflow.sandbox.file_operation_lock import get_file_operation_lock
+from deerflow.sandbox.overwrite import unwrap_sandbox
+from deerflow.sandbox.path_patterns import build_output_mask_pattern, replace_output_path_matches
 from deerflow.sandbox.sandbox import Sandbox
 from deerflow.sandbox.sandbox_provider import get_sandbox_provider
 from deerflow.sandbox.search import GrepMatch
@@ -30,6 +41,15 @@ from deerflow.sandbox.security import LOCAL_HOST_BASH_DISABLED_MESSAGE, is_host_
 from deerflow.tools.types import Runtime
 
 logger = logging.getLogger(__name__)
+
+# The read-before-write middleware can enter the sandbox before or after the
+# tool body. Scope this marker to the complete composed invocation so all of
+# those entries share one live provider decision. Context variables are copied
+# into ``asyncio.to_thread`` workers, keeping the handoff task-local.
+_SANDBOX_AUTHORIZATION_CHECKED: ContextVar[bool] = ContextVar(
+    "deerflow_sandbox_authorization_checked",
+    default=False,
+)
 
 _ABSOLUTE_PATH_PATTERN = re.compile(r"(?<![:\w])(?<!:/)/(?:[^\s\"'`;&|<>()]+)")
 # A ``{...}`` block holding a single identifier-like placeholder (e.g. ``{id}``
@@ -162,6 +182,7 @@ def _extract_skill_name_from_skills_path(path: str) -> str | None:
     /mnt/skills/public/bootstrap/SKILL.md → "bootstrap"
     /mnt/skills/custom/my-skill/SKILL.md → "my-skill"
     /mnt/skills/legacy/my-skill/references/... → "my-skill"
+    /mnt/skills/integrations/lark-cli/lark-doc/SKILL.md → "lark-doc"
     /mnt/skills/public/bootstrap/ → "bootstrap"
     Returns None if the path doesn't contain a recognizable skill name pattern.
     """
@@ -172,13 +193,21 @@ def _extract_skill_name_from_skills_path(path: str) -> str | None:
     relative = path[len(skills_prefix) :].lstrip("/")
     if not relative:
         return None
-    # Expected patterns: "public/<name>/...", "custom/<name>/...", "legacy/<name>/..."
-    # or "<name>/..." (direct skill access)
-    parts = relative.split("/")
+    # Expected patterns: "public/<name>/...", "custom/<name>/...",
+    # "legacy/<name>/...", "integrations/<provider>/<name>/..."
+    # or "<name>/..." (direct skill access). Empty segments are dropped so a
+    # directory entry ("public/", as `ls` emits for dirs) is still recognized as
+    # a category root rather than yielding an empty skill name.
+    parts = [part for part in relative.split("/") if part]
     if len(parts) >= 2 and parts[0] in ("public", "custom", "legacy"):
         return parts[1]
-    if len(parts) == 1 and parts[0] in ("public", "custom", "legacy"):
+    if len(parts) >= 3 and parts[0] == "integrations":
+        return parts[2]
+    if len(parts) == 1 and parts[0] in ("public", "custom", "legacy", "integrations"):
         # Category root like /mnt/skills/custom — not a skill path.
+        return None
+    if len(parts) == 2 and parts[0] == "integrations":
+        # Provider root like /mnt/skills/integrations/lark-cli.
         return None
     if len(parts) >= 1:
         # Direct path like /mnt/skills/my-skill/SKILL.md
@@ -212,6 +241,8 @@ def _is_disabled_skill_path(path: str, *, user_id: str | None = None) -> bool:
             category = "custom"
         elif relative.startswith("legacy/"):
             category = "legacy"
+        elif relative.startswith("integrations/"):
+            category = "integrations"
         else:
             # Try to infer from storage
             effective_uid = user_id or get_effective_user_id()
@@ -239,6 +270,39 @@ def _is_disabled_skill_path(path: str, *, user_id: str | None = None) -> bool:
         # skill's files. See review feedback on PR #3889.
         logger.warning("Failed to determine enabled state, denying access: %s", exc)
         return True
+
+
+def _drop_disabled_skill_paths(paths: list[str], *, user_id: str | None = None) -> list[str]:
+    """Filter out paths that belong to a disabled skill.
+
+    ``_is_disabled_skill_path`` gates the *requested* path, which is enough for
+    ``read_file`` but not for the tools that descend: ``ls``, ``glob`` and
+    ``grep`` return paths other than the one they were given, so a root anywhere
+    above a disabled skill still surfaces its files.  This applies the same check
+    to the results.
+
+    The enabled-state lookup re-reads ``extensions_config.json`` (or the per-user
+    skill state) on every call, so the verdict is memoized per skill — a 100-match
+    grep must not become 100 config reads.
+    """
+    skills_prefix = _get_skills_container_path()
+    verdicts: dict[tuple[str, str], bool] = {}
+    kept: list[str] = []
+    for path in paths:
+        skill_name = _extract_skill_name_from_skills_path(path)
+        if skill_name is None:
+            kept.append(path)
+            continue
+        # Leading segment (the category, or the skill itself in the direct
+        # layout) plus the name identifies the skill the same way
+        # _is_disabled_skill_path does, so paths sharing a key share a verdict.
+        category = path[len(skills_prefix) :].lstrip("/").split("/")[0]
+        key = (category, skill_name)
+        if key not in verdicts:
+            verdicts[key] = _is_disabled_skill_path(path, user_id=user_id)
+        if not verdicts[key]:
+            kept.append(path)
+    return kept
 
 
 def _resolve_skills_path(path: str) -> str:
@@ -271,7 +335,7 @@ def _resolve_skills_path(path: str) -> str:
 
     relative = path[len(skills_container) :].lstrip("/")
 
-    # Per-user custom skills: resolve to user-specific directory.
+    # Per-user custom and globally managed integration skills.
     # ``skill_manage_tool`` writes custom skills to the per-user directory,
     # and ``LocalSandboxProvider._build_thread_path_mappings`` mounts
     # ``/mnt/skills/custom`` to that same per-user dir.  Without this
@@ -290,6 +354,22 @@ def _resolve_skills_path(path: str) -> str:
         if custom_relative:
             return str(user_custom_dir / custom_relative)
         return str(user_custom_dir)
+
+    if relative == "integrations" or relative.startswith("integrations/"):
+        from deerflow.config.paths import get_paths
+
+        paths = get_paths()
+        integrations_dir = paths.integration_skills_dir()
+        integrations_relative = relative[len("integrations") :].lstrip("/")
+        if not integrations_relative:
+            return str(integrations_dir)
+        # Defense-in-depth: even though _reject_path_traversal runs upstream for
+        # sandbox callers, confirm the resolved path stays within the global
+        # integration dir so a lexical ``../`` cannot escape it here.
+        resolved = (integrations_dir / integrations_relative).resolve()
+        if not resolved.is_relative_to(integrations_dir.resolve()):
+            raise PermissionError("Access denied: path traversal detected")
+        return str(integrations_dir / integrations_relative)
 
     return _join_path_preserving_style(skills_host, relative)
 
@@ -350,20 +430,17 @@ def _get_custom_mount_for_path(path: str):
 def _extract_thread_id_from_thread_data(thread_data: "ThreadDataState | None") -> str | None:
     """Extract thread_id from thread_data by inspecting workspace_path.
 
-    The workspace_path has the form
-    ``{base_dir}/threads/{thread_id}/user-data/workspace``, so
-    ``Path(workspace_path).parent.parent.name`` yields the thread_id.
+    The workspace path ends with
+    ``threads/{thread_id}/user-data/workspace``.
     """
     if thread_data is None:
         return None
     workspace_path = thread_data.get("workspace_path")
     if not workspace_path:
         return None
-    try:
-        # {base_dir}/threads/{thread_id}/user-data/workspace → parent.parent = threads/{thread_id}
-        return Path(workspace_path).parent.parent.name
-    except Exception:
-        return None
+    normalized = workspace_path.replace("\\", "/").rstrip("/")
+    parts = normalized.rsplit("/", 3)
+    return parts[-3] if len(parts) == 4 and parts[-3] else None
 
 
 def _get_acp_workspace_host_path(thread_id: str | None = None) -> str | None:
@@ -508,14 +585,12 @@ def _resolve_max_results(name: str, requested: int, *, default: int, upper_bound
     return min(requested_max_results, configured_max_results)
 
 
-def _resolve_local_read_path(path: str, thread_data: ThreadDataState) -> str:
+def _resolve_local_read_path(path: str, thread_data: ThreadDataState | None) -> str:
     validate_local_tool_path(path, thread_data, read_only=True)
-    if _is_skills_path(path) or _is_acp_workspace_path(path):
-        # Skills and ACP workspace paths are resolved by the sandbox's
-        # PathMapping (which uses the user_id from acquire time), not
-        # by _resolve_skills_path / _resolve_acp_workspace_path (which
-        # use get_effective_user_id() from contextvar and may differ
-        # from the sandbox mapping's user_id).
+    if _is_skills_path(path) or _is_acp_workspace_path(path) or _is_custom_mount_path(path):
+        # Mounted paths are resolved by the sandbox's PathMapping (which uses
+        # acquire-time identity and provider state), not by tool-layer host
+        # path reconstruction.
         return path
     return _resolve_and_validate_user_data_path(path, thread_data)
 
@@ -561,6 +636,13 @@ def _join_path_preserving_style(base: str, relative: str) -> str:
     normalized_relative = relative.replace("\\" if separator == "/" else "/", separator).lstrip("/\\")
     stripped_base = base.rstrip("/\\")
     return f"{stripped_base}{separator}{normalized_relative}"
+
+
+def _path_parent(path: str) -> str:
+    """Return a lexical parent without interning high-cardinality path parts."""
+    if "\\" in path and "/" not in path:
+        return ntpath.dirname(path)
+    return posixpath.dirname(path)
 
 
 def _sanitize_error(error: Exception, runtime: Runtime | None = None) -> str:
@@ -665,10 +747,10 @@ def _thread_virtual_to_actual_mappings(thread_data: ThreadDataState) -> dict[str
         mappings[f"{VIRTUAL_PATH_PREFIX}/outputs"] = outputs
 
     # Also map the virtual root when all known dirs share the same parent.
-    actual_dirs = [Path(p) for p in (workspace, uploads, outputs) if p]
+    actual_dirs = [p for p in (workspace, uploads, outputs) if p]
     if actual_dirs:
-        common_parent = str(Path(actual_dirs[0]).parent)
-        if all(str(path.parent) == common_parent for path in actual_dirs):
+        common_parent = _path_parent(actual_dirs[0])
+        if all(_path_parent(path) == common_parent for path in actual_dirs):
             mappings[VIRTUAL_PATH_PREFIX] = common_parent
 
     return mappings
@@ -679,33 +761,43 @@ def _thread_actual_to_virtual_mappings(thread_data: ThreadDataState) -> dict[str
     return {actual: virtual for virtual, actual in _thread_virtual_to_actual_mappings(thread_data).items()}
 
 
-@lru_cache(maxsize=512)
-def _compiled_mask_patterns(sources: tuple[tuple[str, str], ...]) -> tuple[tuple[re.Pattern[str], str, str], ...]:
-    """Compile the host→virtual masking patterns once per source set.
+@lru_cache(maxsize=256)
+def _mask_source_roots(host_base: str) -> tuple[str, ...]:
+    """Return lexical and filesystem-resolved spellings without ``pathlib``.
 
-    ``sources`` is an ordered tuple of ``(host_base, virtual_base)`` pairs
-    (skills, then ACP workspace, then per-thread user-data mappings sorted by
-    host-path length, longest first). The patterns derive only from
-    config-stable + per-thread inputs, so they're cached and reused instead of
-    being rebuilt — ``re.escape`` + ``re.compile`` + ``Path.resolve`` (a
-    syscall) — on every call. ``mask_local_paths_in_output`` runs once per
-    glob/grep match, so without this the same patterns are recompiled per
-    match.
+    ``PurePath`` interns every path component. That is useful for long-lived
+    paths but wasteful for one-off thread IDs, because evicting DeerFlow's LRU
+    does not shrink the interpreter's intern/allocator high-water mark. The
+    bounded cache avoids repeating ``realpath`` walks for every glob/grep match
+    without retaining an unbounded set of thread roots.
     """
+    raw = os.path.normpath(host_base)
+    resolved = os.path.realpath(host_base)
+    return (raw,) if resolved == raw else (raw, resolved)
+
+
+@lru_cache(maxsize=16)
+def _compiled_mask_patterns(sources: tuple[tuple[str, str], ...]) -> tuple[tuple[re.Pattern[str], str, str], ...]:
+    """Compile patterns for the small, process-stable source set.
+
+    Per-user and per-thread sources must never be passed here; they are handled
+    by the non-retaining scanner in ``replace_output_path_matches``.
+    """
+    # The segment boundary and path tail are owned by
+    # ``deerflow.sandbox.path_patterns`` so the static regex path and dynamic
+    # scanner cannot drift.
+    #
+    # ``separator_agnostic=True`` is the one thing this site does differently:
+    # output separators are outside this layer's control.
     compiled: list[tuple[re.Pattern[str], str, str]] = []
     for host_base, virtual_base in sources:
         seen: set[str] = set()
-        # Same base set as ``_path_variants(raw) | _path_variants(resolved)``;
-        # ordered deterministically so the cached tuple is stable (variants of
-        # one host map to the same virtual and don't overlap after substitution,
-        # so order within a source is irrelevant to the result).
-        for root in (str(Path(host_base)), str(Path(host_base).resolve())):
+        for root in _mask_source_roots(host_base):
             for variant in sorted(_path_variants(root)):
                 if variant in seen:
                     continue
                 seen.add(variant)
-                escaped = re.escape(variant).replace(r"\\", r"[/\\]")
-                compiled.append((re.compile(escaped + r"(?:[/\\][^\s\"';&|<>()]*)?"), variant, virtual_base))
+                compiled.append((build_output_mask_pattern(variant, separator_agnostic=True), variant, virtual_base))
     return tuple(compiled)
 
 
@@ -713,18 +805,19 @@ def mask_local_paths_in_output(output: str, thread_data: ThreadDataState | None)
     """Mask host absolute paths from local sandbox output using virtual paths.
 
     Handles user-data paths (per-thread), skills paths (global + per-user
-    custom), and ACP workspace paths (per-thread).
+    custom + managed integrations), and ACP workspace paths (per-thread).
     """
     # Build the ordered (host_base, virtual_base) source list. Order is
     # preserved from the original implementation: skills, then per-user
-    # custom skills, then ACP workspace, then user-data mappings (longest
+    # custom/integration skills, then ACP workspace, then user-data mappings (longest
     # host path first). Custom mount host paths are masked by
     # LocalSandbox._reverse_resolve_paths_in_output().
-    sources: list[tuple[str, str]] = []
+    stable_sources: list[tuple[str, str]] = []
+    dynamic_sources: list[tuple[str, str]] = []
 
     skills_host = _get_skills_host_path()
     if skills_host:
-        sources.append((skills_host, _get_skills_container_path()))
+        stable_sources.append((skills_host, _get_skills_container_path()))
 
     # Per-user custom skills: mask host paths under the user's custom
     # skills directory back to /mnt/skills/custom. The sandbox's
@@ -737,26 +830,31 @@ def mask_local_paths_in_output(output: str, thread_data: ThreadDataState | None)
 
         user_id = get_effective_user_id()
         user_custom_dir = get_paths().user_custom_skills_dir(user_id)
+        integrations_dir = get_paths().integration_skills_dir()
         if user_custom_dir.exists():
             skills_container = _get_skills_container_path()
-            sources.append((str(user_custom_dir), f"{skills_container}/custom"))
+            dynamic_sources.append((str(user_custom_dir), f"{skills_container}/custom"))
+        if integrations_dir.exists():
+            skills_container = _get_skills_container_path()
+            stable_sources.append((str(integrations_dir), f"{skills_container}/integrations"))
     except Exception:
         pass
 
     acp_host = _get_acp_workspace_host_path(_extract_thread_id_from_thread_data(thread_data))
     if acp_host:
-        sources.append((acp_host, _ACP_WORKSPACE_VIRTUAL_PATH))
+        dynamic_sources.append((acp_host, _ACP_WORKSPACE_VIRTUAL_PATH))
 
     if thread_data is not None:
         mappings = _thread_actual_to_virtual_mappings(thread_data)
         for actual_base, virtual_base in sorted(mappings.items(), key=lambda item: len(item[0]), reverse=True):
-            sources.append((actual_base, virtual_base))
+            dynamic_sources.append((actual_base, virtual_base))
 
-    if not sources:
+    if not stable_sources and not dynamic_sources:
         return output
 
     result = output
-    for pattern, base, virtual in _compiled_mask_patterns(tuple(sources)):
+    static_patterns = _compiled_mask_patterns(tuple(stable_sources)) if stable_sources else ()
+    for pattern, base, virtual in static_patterns:
 
         def replace_match(match: re.Match, _base: str = base, _virtual: str = virtual) -> str:
             matched_path = match.group(0)
@@ -766,6 +864,15 @@ def mask_local_paths_in_output(output: str, thread_data: ThreadDataState | None)
             return f"{_virtual}/{relative}" if relative else _virtual
 
         result = pattern.sub(replace_match, result)
+
+    for host_base, virtual_base in dynamic_sources:
+        for root in _mask_source_roots(host_base):
+            result = replace_output_path_matches(
+                result,
+                root,
+                virtual_base,
+                separator_agnostic=True,
+            )
 
     return result
 
@@ -784,8 +891,8 @@ def validate_local_tool_path(path: str, thread_data: ThreadDataState | None, *, 
 
     This function is a security gate — it checks whether *path* may be
     accessed and raises on violation.  It does **not** resolve the virtual
-    path to a host path; callers are responsible for resolution via
-    ``resolve_and_validate_user_data_path`` or ``_resolve_skills_path``.
+    path to a host path. Sandbox-backed readers should keep mounted paths
+    virtual and let the provider's mount table resolve them.
 
     Allowed virtual-path families:
       - ``/mnt/user-data/*``  — always allowed (read + write)
@@ -1195,7 +1302,21 @@ def replace_virtual_paths_in_command(command: str, thread_data: ThreadDataState 
 
     # Replace user-data paths
     if VIRTUAL_PATH_PREFIX in result and thread_data is not None:
-        pattern = re.compile(rf"{re.escape(VIRTUAL_PATH_PREFIX)}(/[^\s\"';&|<>()]*)?")
+        # The segment-boundary lookahead is what keeps the virtual root from
+        # matching inside a sibling that merely shares its prefix
+        # (``/mnt/user-data`` inside ``/mnt/user-data-backup``). The trailing
+        # group needs a ``/`` to consume anything, so without the lookahead the
+        # bare root still matches and the sibling is rewritten into the thread's
+        # host directory — a real path outside the mount contract. Same defect as
+        # #4035 (reverse patterns) and #4053 (masking patterns), mirrored into
+        # this direction.
+        #
+        # The class mirrors ``LocalSandbox._content_pattern``'s rather than
+        # ``_command_pattern``'s: a virtual root can legitimately be followed by
+        # ``:`` (PATH-style concatenation) or ``,``, which the shell-oriented
+        # class rejects — narrowing to it would stop translating paths that
+        # translate today. ``$`` covers a command ending exactly at the root.
+        pattern = re.compile(rf"{re.escape(VIRTUAL_PATH_PREFIX)}(?=/|$|[^\w./-])(/[^\s\"';&|<>()]*)?")
 
         def replace_user_data_match(match: re.Match) -> str:
             return replace_virtual_path(match.group(0), thread_data).replace("\\", "/")
@@ -1241,7 +1362,9 @@ def is_local_sandbox(runtime: Runtime | None) -> bool:
         return False
     if runtime.state is None:
         return False
-    sandbox_state = runtime.state.get("sandbox")
+    # Read-only classification: the id is only matched, so a fork-restored
+    # wrapper is safe to discard here (nothing gets released on this path).
+    sandbox_state, _ = unwrap_sandbox(runtime.state.get("sandbox"))
     if sandbox_state is None:
         return False
     sandbox_id = sandbox_state.get("sandbox_id")
@@ -1264,7 +1387,9 @@ def sandbox_from_runtime(runtime: Runtime | None = None) -> Sandbox:
         raise SandboxRuntimeError("Tool runtime not available")
     if runtime.state is None:
         raise SandboxRuntimeError("Tool runtime state not available")
-    sandbox_state = runtime.state.get("sandbox")
+    # Read-only lookup: this only resolves the provider entry, and ownership
+    # (release) stays with after_agent's short-circuit on the wrapped state.
+    sandbox_state, _ = unwrap_sandbox(runtime.state.get("sandbox"))
     if sandbox_state is None:
         raise SandboxRuntimeError("Sandbox state not initialized in runtime")
     sandbox_id = sandbox_state.get("sandbox_id")
@@ -1277,6 +1402,42 @@ def sandbox_from_runtime(runtime: Runtime | None = None) -> Sandbox:
     if runtime.context is not None:
         runtime.context["sandbox_id"] = sandbox_id  # Ensure sandbox_id is in context for downstream use
     return sandbox
+
+
+@contextmanager
+def sandbox_authorization_scope(runtime: Runtime) -> Iterator[None]:
+    """Authorize once for one complete synchronous sandbox tool invocation."""
+    if _SANDBOX_AUTHORIZATION_CHECKED.get():
+        yield
+        return
+
+    authorize_sandbox_execution(
+        context=runtime.context or {},
+        app_config=safe_app_config(),
+    )
+    token = _SANDBOX_AUTHORIZATION_CHECKED.set(True)
+    try:
+        yield
+    finally:
+        _SANDBOX_AUTHORIZATION_CHECKED.reset(token)
+
+
+@asynccontextmanager
+async def sandbox_authorization_scope_async(runtime: Runtime) -> AsyncIterator[None]:
+    """Authorize once for one complete asynchronous sandbox tool invocation."""
+    if _SANDBOX_AUTHORIZATION_CHECKED.get():
+        yield
+        return
+
+    await authorize_sandbox_execution_async(
+        context=runtime.context or {},
+        app_config=await safe_app_config_async(),
+    )
+    token = _SANDBOX_AUTHORIZATION_CHECKED.set(True)
+    try:
+        yield
+    finally:
+        _SANDBOX_AUTHORIZATION_CHECKED.reset(token)
 
 
 def ensure_sandbox_initialized(runtime: Runtime | None = None) -> Sandbox:
@@ -1303,8 +1464,20 @@ def ensure_sandbox_initialized(runtime: Runtime | None = None) -> Sandbox:
     if runtime.state is None:
         raise SandboxRuntimeError("Tool runtime state not available")
 
+    # Authorization is a live execution policy, not a lifetime property of a
+    # sandbox id. Re-check before both reuse and acquisition so a role or policy
+    # change takes effect on the next sandbox-backed tool call.
+    if not _SANDBOX_AUTHORIZATION_CHECKED.get():
+        authorize_sandbox_execution(
+            context=runtime.context or {},
+            app_config=safe_app_config(),
+        )
+
     # Check if sandbox already exists in state
-    sandbox_state = runtime.state.get("sandbox")
+    # Discarding fork_restored is safe: after_agent short-circuits on the
+    # still-wrapped state before the context-based release branch, so this
+    # reuse path never releases the parent sandbox.
+    sandbox_state, _ = unwrap_sandbox(runtime.state.get("sandbox"))
     if sandbox_state is not None:
         sandbox_id = sandbox_state.get("sandbox_id")
         if sandbox_id is not None:
@@ -1351,7 +1524,17 @@ async def ensure_sandbox_initialized_async(runtime: Runtime | None = None) -> Sa
     if runtime.state is None:
         raise SandboxRuntimeError("Tool runtime state not available")
 
-    sandbox_state = runtime.state.get("sandbox")
+    # Keep the async path aligned with the sync path: persisted sandbox state
+    # must not bypass a newly-revoked sandbox:execute grant.
+    if not _SANDBOX_AUTHORIZATION_CHECKED.get():
+        await authorize_sandbox_execution_async(
+            context=runtime.context or {},
+            app_config=await safe_app_config_async(),
+        )
+
+    # Same discard as the sync path above: the reuse path never releases,
+    # because after_agent short-circuits on the still-wrapped state first.
+    sandbox_state, _ = unwrap_sandbox(runtime.state.get("sandbox"))
     if sandbox_state is not None:
         sandbox_id = sandbox_state.get("sandbox_id")
         if sandbox_id is not None:
@@ -1388,16 +1571,17 @@ async def _run_sync_tool_after_async_sandbox_init(
 ) -> str:
     """Initialize lazily via async provider, then run sync tool body off-thread."""
     try:
-        await ensure_sandbox_initialized_async(runtime)
+        async with sandbox_authorization_scope_async(runtime):
+            await ensure_sandbox_initialized_async(runtime)
+
+            if func is None:
+                return "Error: Tool implementation not available"
+
+            return await asyncio.to_thread(func, runtime, *args)
     except SandboxError as e:
         return f"Error: {e}"
     except Exception as e:
         return f"Error: Unexpected error initializing sandbox: {_sanitize_error(e, runtime)}"
-
-    if func is None:
-        return "Error: Tool implementation not available"
-
-    return await asyncio.to_thread(func, runtime, *args)
 
 
 def ensure_thread_directories_exist(runtime: Runtime | None) -> None:
@@ -1468,32 +1652,65 @@ def mask_secret_values(output: str, injected_env: dict[str, str] | None) -> str:
     return output
 
 
+#: Providers append the shell's authoritative exit marker at the very end of
+#: failing output (local ``Exit Code: N`` incl. timeout 124; remote
+#: ``Command exited with code N`` when output was empty). Truncation must
+#: never cut it away — evidence consumers (acceptance checklist) parse the
+#: marker to recover the actual shell status.
+_BASH_EXIT_MARKER_TAIL_RE = re.compile(r"(?:\nExit Code: -?\d+|\n?Command exited with code -?\d+)\s*$")
+
+#: Floor for the bash output limit: the longest exit marker
+#: (``Command exited with code -128``) is 30 chars, so any smaller configured
+#: limit is raised to keep a failing command's marker preservable. The config
+#: accepts any nonnegative value; below this floor truncation would destroy
+#: the failure evidence it exists to measure.
+_BASH_OUTPUT_MIN_LIMIT_CHARS = 32
+
+
 def _truncate_bash_output(output: str, max_chars: int) -> str:
     """Middle-truncate bash output, preserving head and tail (50/50 split).
 
     bash output may have errors at either end (stderr/stdout ordering is
-    non-deterministic), so both ends are preserved equally.
+    non-deterministic), so both ends are preserved equally. A trailing
+    shell exit marker is always preserved (see
+    ``_BASH_EXIT_MARKER_TAIL_RE``): its budget comes out of the tail, not
+    out of the status evidence.
 
-    The returned string (including the truncation marker) is guaranteed to be
-    no longer than max_chars characters. Pass max_chars=0 to disable truncation
-    and return the full output unchanged.
+    The returned string (including the truncation marker) is no longer than
+    the EFFECTIVE limit, ``max(max_chars, _BASH_OUTPUT_MIN_LIMIT_CHARS)`` —
+    the 32-char floor is applied before anything else (even when the output
+    carries no exit marker) so a trailing marker always stays preservable,
+    meaning a configured limit in 1..31 yields up to 32 chars. Pass
+    max_chars=0 to disable truncation and return the full output unchanged.
     """
     if max_chars == 0:
         return output
+    # Clamp the effective limit to the marker-preserving floor (see
+    # ``_BASH_OUTPUT_MIN_LIMIT_CHARS``): a configured limit smaller than the
+    # exit marker would silently discard failure status.
+    max_chars = max(max_chars, _BASH_OUTPUT_MIN_LIMIT_CHARS)
     if len(output) <= max_chars:
         return output
+    preserved = ""
+    marker_match = _BASH_EXIT_MARKER_TAIL_RE.search(output)
+    if marker_match is not None and len(marker_match.group(0)) < max_chars:
+        preserved = marker_match.group(0)
+        output = output[: marker_match.start()]
+        max_chars -= len(preserved)
+        if len(output) <= max_chars:
+            return output + preserved
     total_len = len(output)
     # Compute the exact worst-case marker length: skipped chars is at most
     # total_len, so this is a tight upper bound.
     marker_max_len = len(f"\n... [middle truncated: {total_len} chars skipped] ...\n")
     kept = max(0, max_chars - marker_max_len)
     if kept == 0:
-        return output[:max_chars]
+        return output[:max_chars] + preserved
     head_len = kept // 2
     tail_len = kept - head_len
     skipped = total_len - kept
     marker = f"\n... [middle truncated: {skipped} chars skipped] ...\n"
-    return f"{output[:head_len]}{marker}{output[-tail_len:] if tail_len > 0 else ''}"
+    return f"{output[:head_len]}{marker}{output[-tail_len:] if tail_len > 0 else ''}" + preserved
 
 
 def _truncate_read_file_output(output: str, max_chars: int) -> str:
@@ -1551,9 +1768,10 @@ CHANNEL_USER_ID_ENV = "DEERFLOW_CHANNEL_USER_ID"
 
 _CHANNEL_USER_ID_CONTEXT_KEY = "channel_user_id"
 
-# body.context is client-writable on web requests, so bound the value: real
-# platform ids are tens of chars; anything past this is hostile or corrupt and
-# must not bloat every command string sent to the sandbox.
+# Gateway accepts this identity only from internally authenticated channel
+# requests, but embedded runtimes can still construct context directly. Bound
+# the value defensively: real platform ids are tens of chars; anything past
+# this is corrupt and must not bloat every sandbox command string.
 _CHANNEL_USER_ID_MAX_LEN = 256
 
 
@@ -1637,8 +1855,37 @@ def _github_env_from_runtime(runtime: Runtime) -> dict[str, str] | None:
     return {"GH_TOKEN": token, "GITHUB_TOKEN": token}
 
 
+_LARK_CLI_COMMAND_RE = re.compile(r"(?<![A-Za-z0-9_.-])lark-cli(?![A-Za-z0-9_.-])")
+
+
+def _lark_cli_env_from_runtime(runtime: Runtime, command: str, *, sandbox_paths: bool) -> dict[str, str] | None:
+    """Expose Settings-page Lark auth to sandbox ``lark-cli`` commands.
+
+    Settings authorizes ``lark-cli`` under DeerFlow's per-user integration
+    config/data directories. Agent conversations invoke ``lark-cli`` through the
+    sandbox, so lark commands must receive those same directories or they see an
+    unrelated unauthenticated profile. Keep this scoped to commands that
+    actually call ``lark-cli`` so ordinary bash calls do not switch AIO into the
+    env-bearing execution path.
+
+    In broker mode (Pattern B, issue #4338) a sidecar owns the credentials, so
+    the overlay carries only the broker URL + runtime PATH — the config/data
+    directories are never injected into the sandbox.
+    """
+    if not _LARK_CLI_COMMAND_RE.search(command):
+        return None
+    try:
+        from deerflow.integrations.lark_cli import lark_cli_env_overlay, sandbox_lark_broker_active
+
+        broker = sandbox_paths and sandbox_lark_broker_active()
+        return lark_cli_env_overlay(resolve_runtime_user_id(runtime), sandbox_paths=sandbox_paths, broker=broker)
+    except Exception:
+        logger.warning("Could not build Lark CLI env overlay; running command without managed auth", exc_info=True)
+        return None
+
+
 @tool("bash", parse_docstring=True)
-def bash_tool(runtime: Runtime, description: str, command: str) -> str:
+def bash_tool(runtime: Runtime, command: str, description: str = "") -> str:
     """Execute a bash command in a Linux environment.
 
 
@@ -1651,8 +1898,8 @@ def bash_tool(runtime: Runtime, description: str, command: str) -> str:
       it is killed at the command timeout.
 
     Args:
-        description: Explain why you are running this command in short words. ALWAYS PROVIDE THIS PARAMETER FIRST.
         command: The bash command to execute. Always use absolute paths for files and directories.
+        description: Optional short explanation of this command shown in the UI.
     """
     try:
         sandbox = ensure_sandbox_initialized(runtime)
@@ -1663,8 +1910,11 @@ def bash_tool(runtime: Runtime, description: str, command: str) -> str:
         injected_env = read_active_secrets(getattr(runtime, "context", None)) or None
         identity_prefix = _channel_identity_prefix(runtime)
         github_env = _github_env_from_runtime(runtime)
+        lark_cli_env = _lark_cli_env_from_runtime(runtime, command, sandbox_paths=not is_local_sandbox(runtime))
         if github_env:
             injected_env = {**(injected_env or {}), **github_env}
+        if lark_cli_env:
+            injected_env = {**(injected_env or {}), **lark_cli_env}
         if is_local_sandbox(runtime):
             if not is_host_bash_allowed():
                 return f"Error: {LOCAL_HOST_BASH_DISABLED_MESSAGE}"
@@ -1692,6 +1942,7 @@ def bash_tool(runtime: Runtime, description: str, command: str) -> str:
                 max_chars,
             )
         ensure_thread_directories_exist(runtime)
+        command = f"cd {VIRTUAL_PATH_PREFIX}/workspace; {command}"
         if identity_prefix:
             command = identity_prefix + command
         try:
@@ -1710,24 +1961,25 @@ def bash_tool(runtime: Runtime, description: str, command: str) -> str:
         return f"Error: Unexpected error executing command: {_sanitize_error(e, runtime)}"
 
 
-async def _bash_tool_async(runtime: Runtime, description: str, command: str) -> str:
-    return await _run_sync_tool_after_async_sandbox_init(bash_tool.func, runtime, description, command)
+async def _bash_tool_async(runtime: Runtime, command: str, description: str = "") -> str:
+    return await _run_sync_tool_after_async_sandbox_init(bash_tool.func, runtime, command, description)
 
 
 bash_tool.coroutine = _bash_tool_async
 
 
 @tool("ls", parse_docstring=True)
-def ls_tool(runtime: Runtime, description: str, path: str) -> str:
+def ls_tool(runtime: Runtime, path: str, description: str = "") -> str:
     """List the contents of a directory up to 2 levels deep in tree format.
 
     Args:
-        description: Explain why you are listing this directory in short words. ALWAYS PROVIDE THIS PARAMETER FIRST.
         path: The **absolute** path to the directory to list.
+        description: Optional short explanation of this listing shown in the UI.
     """
     try:
+        user_id = resolve_runtime_user_id(runtime)
         # Block access to disabled skill directories
-        if _is_disabled_skill_path(path, user_id=resolve_runtime_user_id(runtime)):
+        if _is_disabled_skill_path(path, user_id=user_id):
             skill_name = _extract_skill_name_from_skills_path(path) or "unknown"
             return f"Error: Skill '{skill_name}' is disabled. Access to its files is blocked. Enable the skill in settings before using it."
         sandbox = ensure_sandbox_initialized(runtime)
@@ -1753,6 +2005,12 @@ def ls_tool(runtime: Runtime, description: str, path: str) -> str:
         output = "\n".join(children)
         if thread_data is not None:
             output = mask_local_paths_in_output(output, thread_data)
+        # The gate above only covers `path` itself; the listing descends into
+        # children, so a root above a disabled skill still exposes its files.
+        entries = _drop_disabled_skill_paths(output.splitlines(), user_id=user_id)
+        if not entries:
+            return "(empty)"
+        output = "\n".join(entries)
         try:
             from deerflow.config.app_config import get_app_config
 
@@ -1771,8 +2029,8 @@ def ls_tool(runtime: Runtime, description: str, path: str) -> str:
         return f"Error: Unexpected error listing directory: {_sanitize_error(e, runtime)}"
 
 
-async def _ls_tool_async(runtime: Runtime, description: str, path: str) -> str:
-    return await _run_sync_tool_after_async_sandbox_init(ls_tool.func, runtime, description, path)
+async def _ls_tool_async(runtime: Runtime, path: str, description: str = "") -> str:
+    return await _run_sync_tool_after_async_sandbox_init(ls_tool.func, runtime, path, description)
 
 
 ls_tool.coroutine = _ls_tool_async
@@ -1781,22 +2039,27 @@ ls_tool.coroutine = _ls_tool_async
 @tool("glob", parse_docstring=True)
 def glob_tool(
     runtime: Runtime,
-    description: str,
     pattern: str,
     path: str,
+    description: str = "",
     include_dirs: bool = False,
     max_results: int = _DEFAULT_GLOB_MAX_RESULTS,
 ) -> str:
     """Find files or directories that match a glob pattern under a root directory.
 
     Args:
-        description: Explain why you are searching for these paths in short words. ALWAYS PROVIDE THIS PARAMETER FIRST.
         pattern: The glob pattern to match relative to the root path, for example `**/*.py`.
         path: The **absolute** root directory to search under.
+        description: Optional short explanation of this search shown in the UI.
         include_dirs: Whether matching directories should also be returned. Default is False.
         max_results: Maximum number of paths to return. Default is 200.
     """
     try:
+        user_id = resolve_runtime_user_id(runtime)
+        # Block access to disabled skill directories
+        if _is_disabled_skill_path(path, user_id=user_id):
+            skill_name = _extract_skill_name_from_skills_path(path) or "unknown"
+            return f"Error: Skill '{skill_name}' is disabled. Access to its files is blocked. Enable the skill in settings before using it."
         sandbox = ensure_sandbox_initialized(runtime)
         ensure_thread_directories_exist(runtime)
         requested_path = path
@@ -1815,6 +2078,9 @@ def glob_tool(
         matches, truncated = sandbox.glob(path, pattern, include_dirs=include_dirs, max_results=effective_max_results)
         if thread_data is not None:
             matches = [mask_local_paths_in_output(match, thread_data) for match in matches]
+        # The gate above only covers `path` itself; the search descends into it,
+        # so a root above a disabled skill still surfaces its files.
+        matches = _drop_disabled_skill_paths(matches, user_id=user_id)
         return _format_glob_results(requested_path, matches, truncated)
     except SandboxError as e:
         return f"Error: {e}"
@@ -1830,18 +2096,18 @@ def glob_tool(
 
 async def _glob_tool_async(
     runtime: Runtime,
-    description: str,
     pattern: str,
     path: str,
+    description: str = "",
     include_dirs: bool = False,
     max_results: int = _DEFAULT_GLOB_MAX_RESULTS,
 ) -> str:
     return await _run_sync_tool_after_async_sandbox_init(
         glob_tool.func,
         runtime,
-        description,
         pattern,
         path,
+        description,
         include_dirs,
         max_results,
     )
@@ -1853,26 +2119,31 @@ glob_tool.coroutine = _glob_tool_async
 @tool("grep", parse_docstring=True)
 def grep_tool(
     runtime: Runtime,
-    description: str,
     pattern: str,
     path: str,
+    description: str = "",
     glob: str | None = None,
     literal: bool = False,
     case_sensitive: bool = False,
     max_results: int = _DEFAULT_GREP_MAX_RESULTS,
 ) -> str:
-    """Search for matching lines inside text files under a root directory.
+    """Search for matching lines inside a text file or files under a root directory.
 
     Args:
-        description: Explain why you are searching file contents in short words. ALWAYS PROVIDE THIS PARAMETER FIRST.
         pattern: The string or regex pattern to search for.
-        path: The **absolute** root directory to search under.
+        path: The **absolute** file or root directory to search.
+        description: Optional short explanation of this search shown in the UI.
         glob: Optional glob filter for candidate files, for example `**/*.py`.
         literal: Whether to treat `pattern` as a plain string. Default is False.
         case_sensitive: Whether matching is case-sensitive. Default is False.
         max_results: Maximum number of matching lines to return. Default is 100.
     """
     try:
+        user_id = resolve_runtime_user_id(runtime)
+        # Block access to disabled skill directories
+        if _is_disabled_skill_path(path, user_id=user_id):
+            skill_name = _extract_skill_name_from_skills_path(path) or "unknown"
+            return f"Error: Skill '{skill_name}' is disabled. Access to its files is blocked. Enable the skill in settings before using it."
         sandbox = ensure_sandbox_initialized(runtime)
         ensure_thread_directories_exist(runtime)
         requested_path = path
@@ -1905,6 +2176,10 @@ def grep_tool(
                 )
                 for match in matches
             ]
+        # The gate above only covers `path` itself; the search descends into it,
+        # so a root above a disabled skill still surfaces its file contents.
+        allowed = set(_drop_disabled_skill_paths([match.path for match in matches], user_id=user_id))
+        matches = [match for match in matches if match.path in allowed]
         return _format_grep_results(requested_path, matches, truncated)
     except SandboxError as e:
         return f"Error: {e}"
@@ -1922,9 +2197,9 @@ def grep_tool(
 
 async def _grep_tool_async(
     runtime: Runtime,
-    description: str,
     pattern: str,
     path: str,
+    description: str = "",
     glob: str | None = None,
     literal: bool = False,
     case_sensitive: bool = False,
@@ -1933,9 +2208,9 @@ async def _grep_tool_async(
     return await _run_sync_tool_after_async_sandbox_init(
         grep_tool.func,
         runtime,
-        description,
         pattern,
         path,
+        description,
         glob,
         literal,
         case_sensitive,
@@ -1946,6 +2221,23 @@ async def _grep_tool_async(
 grep_tool.coroutine = _grep_tool_async
 
 
+def _read_file_from_sandbox(
+    runtime: Runtime | None,
+    path: str,
+    *,
+    start_line: int | None = None,
+    end_line: int | None = None,
+) -> str:
+    """Read through the sandbox while preserving provider-owned mount paths."""
+    sandbox = ensure_sandbox_initialized(runtime)
+    ensure_thread_directories_exist(runtime)
+    if is_local_sandbox(runtime):
+        path = _resolve_local_read_path(path, get_thread_data(runtime))
+    if start_line is None and end_line is None:
+        return sandbox.read_file(path)
+    return sandbox.read_file(path, start_line=start_line, end_line=end_line)
+
+
 def read_current_file_content(runtime: Runtime | None, path: str) -> str:
     """Read the full current content of ``path`` using read_file's resolution rules.
 
@@ -1954,48 +2246,48 @@ def read_current_file_content(runtime: Runtime | None, path: str) -> str:
     ``FileNotFoundError`` when the file does not exist; other sandbox errors
     propagate to the caller.
     """
-    sandbox = ensure_sandbox_initialized(runtime)
-    ensure_thread_directories_exist(runtime)
-    if is_local_sandbox(runtime):
-        thread_data = get_thread_data(runtime)
-        validate_local_tool_path(path, thread_data, read_only=True)
-        if _is_skills_path(path):
-            path = _resolve_skills_path(path)
-        elif _is_acp_workspace_path(path):
-            path = _resolve_acp_workspace_path(path, _extract_thread_id_from_thread_data(thread_data))
-        elif not _is_custom_mount_path(path):
-            path = _resolve_and_validate_user_data_path(path, thread_data)
-        # Custom mount paths are resolved by LocalSandbox._resolve_path()
-    return sandbox.read_file(path)
+    return _read_file_from_sandbox(runtime, path)
 
 
 @tool("read_file", parse_docstring=True)
 def read_file_tool(
     runtime: Runtime,
-    description: str,
     path: str,
+    description: str = "",
     start_line: int | None = None,
     end_line: int | None = None,
 ) -> str:
     """Read the contents of a text file. Use this to examine source code, configuration files, logs, or any text-based file.
 
     Args:
-        description: Explain why you are reading this file in short words. ALWAYS PROVIDE THIS PARAMETER FIRST.
         path: The **absolute** path to the file to read.
-        start_line: Optional starting line number (1-indexed, inclusive). Use with end_line to read a specific range.
-        end_line: Optional ending line number (1-indexed, inclusive). Use with start_line to read a specific range.
+        description: Optional short explanation of this read shown in the UI.
+        start_line: Optional starting line number (1-indexed, inclusive). Omit to start at the first line.
+        end_line: Optional ending line number (1-indexed, inclusive). Omit to read through the last line.
     """
     try:
         # Block access to disabled skill files
         if _is_disabled_skill_path(path, user_id=resolve_runtime_user_id(runtime)):
             skill_name = _extract_skill_name_from_skills_path(path) or "unknown"
             return f"Error: Skill '{skill_name}' is disabled. Access to its files is blocked. Enable the skill in settings before using it."
+        if start_line is not None and start_line < 1:
+            return "(start_line must be >= 1)"
+        effective_start = start_line or 1
+        if end_line is not None and end_line < 1:
+            return "(end_line must be >= 1)"
+        if end_line is not None and effective_start > end_line:
+            return "(start_line > end_line — no lines in range)"
+
         requested_path = path
-        content = read_current_file_content(runtime, path)
+        use_line_range = start_line is not None or end_line is not None
+        if use_line_range:
+            content = _read_file_from_sandbox(runtime, path, start_line=start_line, end_line=end_line)
+        else:
+            content = read_current_file_content(runtime, path)
         if not content:
+            if start_line is not None and start_line > 1:
+                return "(start_line exceeds file length)"
             return "(empty)"
-        if start_line is not None and end_line is not None:
-            content = "\n".join(content.splitlines()[start_line - 1 : end_line])
         try:
             from deerflow.config.app_config import get_app_config
 
@@ -2024,12 +2316,12 @@ def read_file_tool(
 
 async def _read_file_tool_async(
     runtime: Runtime,
-    description: str,
     path: str,
+    description: str = "",
     start_line: int | None = None,
     end_line: int | None = None,
 ) -> str:
-    return await _run_sync_tool_after_async_sandbox_init(read_file_tool.func, runtime, description, path, start_line, end_line)
+    return await _run_sync_tool_after_async_sandbox_init(read_file_tool.func, runtime, path, description, start_line, end_line)
 
 
 read_file_tool.coroutine = _read_file_tool_async
@@ -2055,9 +2347,9 @@ def _effective_write_file_max_bytes() -> int:
 @tool("write_file", parse_docstring=True)
 def write_file_tool(
     runtime: Runtime,
-    description: str,
     path: str,
     content: str,
+    description: str = "",
     append: bool = False,
 ) -> str:
     """Write text content to a file. By default this overwrites the target file; set append=True to add content to the end without replacing existing content.
@@ -2089,9 +2381,9 @@ def write_file_tool(
     (0 disables the guard entirely). Raising it risks streaming timeouts.
 
     Args:
-        description: Explain why you are writing to this file in short words. ALWAYS PROVIDE THIS PARAMETER FIRST.
-        path: The **absolute** path to the file to write to. ALWAYS PROVIDE THIS PARAMETER SECOND.
-        content: The content to write to the file. ALWAYS PROVIDE THIS PARAMETER THIRD.
+        path: The **absolute** path to the file to write to.
+        content: The content to write to the file.
+        description: Optional short explanation of this write shown in the UI.
         append: Whether to append content to the end of the file instead of overwriting it. Defaults to False.
     """
     if not append:
@@ -2140,12 +2432,12 @@ def write_file_tool(
 
 async def _write_file_tool_async(
     runtime: Runtime,
-    description: str,
     path: str,
     content: str,
+    description: str = "",
     append: bool = False,
 ) -> str:
-    return await _run_sync_tool_after_async_sandbox_init(write_file_tool.func, runtime, description, path, content, append)
+    return await _run_sync_tool_after_async_sandbox_init(write_file_tool.func, runtime, path, content, description, append)
 
 
 write_file_tool.coroutine = _write_file_tool_async
@@ -2154,10 +2446,10 @@ write_file_tool.coroutine = _write_file_tool_async
 @tool("str_replace", parse_docstring=True)
 def str_replace_tool(
     runtime: Runtime,
-    description: str,
     path: str,
     old_str: str,
     new_str: str,
+    description: str = "",
     replace_all: bool = False,
 ) -> str:
     """Replace a substring in a file with another substring.
@@ -2167,10 +2459,10 @@ def str_replace_tool(
     version with read_file first; any write invalidates earlier reads.
 
     Args:
-        description: Explain why you are replacing the substring in short words. ALWAYS PROVIDE THIS PARAMETER FIRST.
-        path: The **absolute** path to the file to replace the substring in. ALWAYS PROVIDE THIS PARAMETER SECOND.
-        old_str: The substring to replace. ALWAYS PROVIDE THIS PARAMETER THIRD.
-        new_str: The new substring. ALWAYS PROVIDE THIS PARAMETER FOURTH.
+        path: The **absolute** path to the file to replace the substring in.
+        old_str: The substring to replace.
+        new_str: The new substring.
+        description: Optional short explanation of this replacement shown in the UI.
         replace_all: Whether to replace all occurrences of the substring. If False, only the first occurrence will be replaced. Default is False.
     """
     try:
@@ -2185,9 +2477,11 @@ def str_replace_tool(
             # Custom mount paths are resolved by LocalSandbox._resolve_path()
         with get_file_operation_lock(sandbox, path):
             content = sandbox.read_file(path)
-            if not content:
+            if not old_str:
+                # A no-op edit. str.replace("", new_str) would insert new_str at
+                # every character boundary, so this cannot fall through.
                 return "OK"
-            if old_str not in content:
+            if not content or old_str not in content:
                 return f"Error: String to replace not found in file: {requested_path}"
             if replace_all:
                 content = content.replace(old_str, new_str)
@@ -2207,19 +2501,19 @@ def str_replace_tool(
 
 async def _str_replace_tool_async(
     runtime: Runtime,
-    description: str,
     path: str,
     old_str: str,
     new_str: str,
+    description: str = "",
     replace_all: bool = False,
 ) -> str:
     return await _run_sync_tool_after_async_sandbox_init(
         str_replace_tool.func,
         runtime,
-        description,
         path,
         old_str,
         new_str,
+        description,
         replace_all,
     )
 

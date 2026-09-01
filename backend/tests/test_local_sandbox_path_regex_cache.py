@@ -1,14 +1,15 @@
-"""Issue #3647 — LocalSandbox must compile its path-rewrite regexes once per
-sandbox (cached), not on every bash/read_file/write_file call, while keeping
-the exact same rewriting behavior.
+"""Issue #3647 — LocalSandbox caches stable forward-path data while dynamic
+host-path masking avoids process-global regex retention.
 """
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 import pytest
 
+from deerflow.sandbox.local import local_sandbox as local_sandbox_module
 from deerflow.sandbox.local.local_sandbox import LocalSandbox, PathMapping
 
 
@@ -31,16 +32,30 @@ def test_patterns_are_compiled_once_and_cached(tmp_path):
     # Each cached_property returns the identical object across accesses.
     assert sb._command_pattern is sb._command_pattern
     assert sb._content_pattern is sb._content_pattern
-    assert sb._reverse_output_patterns is sb._reverse_output_patterns
-    # Two mappings -> two reverse-output patterns.
-    assert len(sb._reverse_output_patterns) == 2
+    assert sb._resolved_local_paths is sb._resolved_local_paths
+
+
+def test_reverse_output_does_not_compile_regexes_for_unique_sandbox_paths(tmp_path):
+    """Evicted sandboxes must not leave their thread paths in ``re``'s caches."""
+    resolved_tmp_path = str(tmp_path.resolve())
+    for index in range(32):
+        workspace = tmp_path / f"thread-{index}" / "workspace"
+        workspace.mkdir(parents=True)
+        sandbox = LocalSandbox(
+            id=f"thread-{index}",
+            path_mappings=[PathMapping(container_path="/mnt/user-data/workspace", local_path=str(workspace))],
+        )
+
+        assert sandbox._reverse_resolve_paths_in_output(f"wrote {workspace}/result.txt") == "wrote /mnt/user-data/workspace/result.txt"
+
+    assert all(resolved_tmp_path not in str(cache_key) for cache_key in re._cache)
 
 
 def test_empty_mappings_yield_no_pattern(tmp_path):
     sb = LocalSandbox(id="empty", path_mappings=[])
     assert sb._command_pattern is None
     assert sb._content_pattern is None
-    assert sb._reverse_output_patterns == []
+    assert sb._resolved_local_paths == {}
     # No mappings -> command/content pass through unchanged.
     assert sb._resolve_paths_in_command("echo hello") == "echo hello"
     assert sb._resolve_paths_in_content("plain text") == "plain text"
@@ -133,6 +148,40 @@ def test_reverse_resolve_translates_a_bare_root_at_end_of_output(tmp_path, prefi
 
     assert out == f"{prefix}/mnt/skills"
     assert skills_local not in out
+
+
+def test_reverse_resolve_path_matches_windows_backslash_containment(monkeypatch):
+    """Regression for the os.sep containment fix in ``_reverse_resolve_path``.
+
+    ``Path.resolve()`` always renders with the native separator (backslash on
+    Windows). The containment check used to hardcode a ``"/"`` suffix, so a
+    backslash-joined nested path could never satisfy
+    ``path_str.startswith(local_path_resolved + "/")`` on Windows and silently
+    fell through to the "no mapping found" branch, leaking the raw host path
+    (real username, full directory tree) instead of the virtual
+    ``/mnt/user-data/...`` path.
+
+    CI runs only on POSIX, so the test stubs ``os.path.realpath`` and the cached
+    roots to reproduce Windows' backslash-joined result.
+    """
+    sb = LocalSandbox(
+        id="windows-sep-test",
+        path_mappings=[
+            PathMapping(container_path="/mnt/user-data/workspace", local_path="C:\\Users\\test\\workspace"),
+        ],
+    )
+    mapping = sb.path_mappings[0]
+
+    monkeypatch.setattr(local_sandbox_module.os, "sep", "\\")
+    # Bypass the real (POSIX) filesystem resolution this cached_property would
+    # otherwise perform and pin it directly to the Windows-resolved root.
+    sb._resolved_local_paths = {mapping: "C:\\Users\\test\\workspace"}
+
+    monkeypatch.setattr(local_sandbox_module.os.path, "realpath", lambda raw: raw.replace("/", "\\"))
+
+    result = sb._reverse_resolve_path("C:\\Users\\test\\workspace\\sub\\f.txt")
+
+    assert result == "/mnt/user-data/workspace/sub/f.txt"
 
 
 def test_resolved_paths_and_sorted_views_are_cached(tmp_path):

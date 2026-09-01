@@ -47,6 +47,10 @@ class E2BSandbox(Sandbox):
             :data:`DEFAULT_E2B_HOME_DIR`.
     """
 
+    #: Every call is a fresh ``sandbox.commands.run`` execution — no shell
+    #: state survives into the next command.
+    persistent_shell_sessions = False
+
     def __init__(
         self,
         id: str,
@@ -74,7 +78,7 @@ class E2BSandbox(Sandbox):
     @property
     def sandbox_id(self) -> str:
         """e2b-side sandbox id (different from DeerFlow's ``self.id`` cache key)."""
-        return getattr(self._client, "sandbox_id", self.id)
+        return getattr(self._client, "sandbox_id", None) or self.id
 
     def close(self) -> None:
         with self._lock:
@@ -161,8 +165,12 @@ class E2BSandbox(Sandbox):
                     output = f"{stdout}\n{stderr}"
                 else:
                     output = stdout or stderr
-                if exit_code not in (0, None) and not output:
-                    output = f"Command exited with code {exit_code}"
+                if exit_code not in (0, None):
+                    # Mirror LocalSandbox: a nonzero exit must survive in the
+                    # output text even when the command produced output, so
+                    # evidence consumers (acceptance checklist) can recover the
+                    # actual shell status.
+                    output = f"{output}\nExit Code: {exit_code}" if output else f"Command exited with code {exit_code}"
                 return output if output else "(no output)"
             except Exception as e:
                 if _is_sandbox_gone_error(e):
@@ -205,13 +213,23 @@ class E2BSandbox(Sandbox):
             logger.warning("e2b sandbox ping raised non-fatal error: %s", e)
             return True
 
-    def read_file(self, path: str) -> str:
+    def read_file(
+        self,
+        path: str,
+        start_line: int | None = None,
+        end_line: int | None = None,
+    ) -> str:
         resolved = self._resolve_path(path)
         try:
             content = self._client.files.read(resolved)
-            if isinstance(content, bytes):
-                return content.decode("utf-8", errors="replace")
-            return content if content is not None else ""
+            if start_line is None and end_line is None:
+                return content.decode("utf-8", errors="replace") if isinstance(content, bytes) else content or ""
+            text = content.decode("utf-8", errors="replace") if isinstance(content, bytes) else content or ""
+            lines = text.splitlines()
+            start = start_line or 1
+            end = end_line if end_line is not None else len(lines)
+            content = "\n".join(lines[start - 1 : end])
+            return content
         except Exception as e:
             logger.error("Failed to read file %s in e2b sandbox: %s", resolved, e)
             return f"Error: {e}"
@@ -428,6 +446,13 @@ class E2BSandbox(Sandbox):
         else:
             flags.append("-E")
         if glob is not None:
+            # ``grep --include`` only matches by basename, at any depth -- it
+            # cannot express a directory-scoping prefix like ``src/`` in
+            # ``src/*.js``. Pass just the basename portion as a coarse
+            # pre-filter (a superset of the true match set: every file
+            # ``path_matches`` can accept also satisfies this basename
+            # pattern) and enforce the real directory scope below via
+            # ``path_matches``, the same helper ``glob()`` uses.
             include_pattern = glob.split("/")[-1] or glob
             flags.append(f"--include={include_pattern}")
 
@@ -448,6 +473,9 @@ class E2BSandbox(Sandbox):
                 logger.error("Failed to grep in e2b sandbox: %s", e)
                 return [], False
 
+        root = resolved.rstrip("/") or "/"
+        root_prefix = root if root == "/" else f"{root}/"
+
         matches: list[GrepMatch] = []
         truncated = False
         for raw in output.splitlines():
@@ -461,6 +489,14 @@ class E2BSandbox(Sandbox):
                 continue
             if should_ignore_path(file_path):
                 continue
+            if glob is not None:
+                # Restrict to the caller's real directory scope -- the
+                # ``--include`` flag above only pre-filtered by basename.
+                if file_path != root and not file_path.startswith(root_prefix):
+                    continue
+                rel_path = file_path.rsplit("/", 1)[-1] if file_path == root else file_path[len(root) :].lstrip("/")
+                if not path_matches(glob, rel_path):
+                    continue
             matches.append(
                 GrepMatch(
                     path=file_path,

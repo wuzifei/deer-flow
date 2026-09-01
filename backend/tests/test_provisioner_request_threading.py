@@ -15,6 +15,41 @@ from blockbuster import BlockBuster
 from kubernetes.client.rest import ApiException
 
 
+def test_provisioner_thread_id_pattern_matches_gateway_contract(provisioner_module) -> None:
+    from deerflow.utils.thread_id import THREAD_ID_PATTERN
+
+    assert provisioner_module.SAFE_THREAD_ID_PATTERN == THREAD_ID_PATTERN
+
+
+@pytest.mark.parametrize("thread_id", ["", "thread.with.dot", "../escape", "x" * 65])
+def test_provisioner_rejects_noncanonical_thread_ids(provisioner_module, thread_id: str) -> None:
+    from pydantic import ValidationError
+
+    with pytest.raises(ValidationError):
+        provisioner_module.CreateSandboxRequest(
+            sandbox_id="sandbox-validation",
+            thread_id=thread_id,
+        )
+
+
+@pytest.mark.parametrize("thread_id", ["a", "A1_b-2", "x" * 64])
+def test_provisioner_accepts_canonical_thread_ids(provisioner_module, thread_id: str) -> None:
+    request = provisioner_module.CreateSandboxRequest(
+        sandbox_id="sandbox-validation",
+        thread_id=thread_id,
+    )
+
+    assert request.thread_id == thread_id
+
+
+def test_provisioner_request_defaults_skills_container_path(provisioner_module) -> None:
+    request = provisioner_module.CreateSandboxRequest(
+        sandbox_id="sandbox-validation",
+    )
+
+    assert request.skills_container_path == "/mnt/skills"
+
+
 class _RecordingCoreV1:
     def __init__(
         self,
@@ -144,14 +179,16 @@ async def test_sandbox_business_routes_run_k8s_client_off_event_loop_thread(
         ready_after_service_reads={"sandbox-new": 3},
     )
     monkeypatch.setattr(provisioner_module, "core_v1", fake_core_v1)
+    monkeypatch.setattr(provisioner_module, "PROVISIONER_API_KEY", "test-secret")
 
     with _detect_provisioner_blocking_io(provisioner_module):
         transport = httpx.ASGITransport(app=provisioner_module.app)
         async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
+            headers = {"X-API-Key": "test-secret"}
             if json_body is None:
-                response = await client.request(method, path)
+                response = await client.request(method, path, headers=headers)
             else:
-                response = await client.request(method, path, json=json_body)
+                response = await client.request(method, path, json=json_body, headers=headers)
 
     assert response.status_code == 200
     assert fake_core_v1.thread_ids
@@ -165,7 +202,7 @@ async def test_sandbox_business_routes_run_k8s_client_off_event_loop_thread(
     [
         (
             False,
-            ["skills-public", "skills-custom", "user-data"],
+            ["skills-public", "skills-custom", "skills-legacy", "user-data"],
         ),
         (
             True,
@@ -201,6 +238,41 @@ def test_create_sandbox_route_builds_expected_skills_mount_layout(
     mount_names = [mount.name for mount in pod.spec.containers[0].volume_mounts]
     assert volume_names == expected_mount_names
     assert mount_names == expected_mount_names
+
+
+def test_create_sandbox_route_threads_custom_skills_root_into_pod(
+    monkeypatch: pytest.MonkeyPatch,
+    provisioner_module,
+) -> None:
+    fake_core_v1 = _RecordingCoreV1(
+        event_loop_thread_id=-1,
+        ready_after_service_reads={"sandbox-custom-skills": 1},
+    )
+    monkeypatch.setattr(provisioner_module, "core_v1", fake_core_v1)
+    categories = ("public", "custom", "legacy", "integrations")
+
+    response = provisioner_module.create_sandbox(
+        provisioner_module.CreateSandboxRequest(
+            sandbox_id="sandbox-custom-skills",
+            thread_id="thread-1",
+            user_id="alice",
+            skills_container_path="/custom-skills",
+            extra_mounts=[
+                provisioner_module.ExtraMount(
+                    host_path=(f"/.deer-flow/users/alice/threads/thread-1/skills_view/{category}"),
+                    container_path=f"/custom-skills/{category}",
+                    read_only=True,
+                )
+                for category in categories
+            ],
+        )
+    )
+
+    assert response.status == "Running"
+    pod = fake_core_v1.created_pod_specs["sandbox-custom-skills"]
+    mount_paths = {mount.mount_path for mount in pod.spec.containers[0].volume_mounts}
+    assert not any(path.startswith("/mnt/skills") for path in mount_paths)
+    assert {f"/custom-skills/{category}" for category in categories} <= mount_paths
 
 
 def test_create_sandbox_retries_transient_service_read_errors(monkeypatch: pytest.MonkeyPatch, provisioner_module) -> None:
@@ -250,3 +322,50 @@ def test_sandbox_service_supports_cluster_ip_with_dns_url(provisioner_module) ->
     assert service.spec.ports[0].port == 8080
     assert service.spec.ports[0].target_port == 8080
     assert provisioner_module._sandbox_url("abc123") == ("http://sandbox-abc123-svc.mdv-sit.svc.cluster.local:8080")
+
+
+@pytest.mark.asyncio
+async def test_auth_middleware(monkeypatch: pytest.MonkeyPatch, provisioner_module) -> None:
+    """Verify the X-API-Key middleware: /health is open; /api/* requires a correct key."""
+    monkeypatch.setattr(provisioner_module, "PROVISIONER_API_KEY", "test-secret")
+    fake_core_v1 = _RecordingCoreV1(event_loop_thread_id=-1)
+    monkeypatch.setattr(provisioner_module, "core_v1", fake_core_v1)
+
+    transport = httpx.ASGITransport(app=provisioner_module.app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
+        # /health is always open — no key needed
+        r = await client.get("/health")
+        assert r.status_code == 200
+
+        # /api/* with no header → 401
+        r = await client.get("/api/sandboxes")
+        assert r.status_code == 401
+
+        # /api/* with wrong key → 401
+        r = await client.get("/api/sandboxes", headers={"X-API-Key": "wrong-key"})
+        assert r.status_code == 401
+
+        # /api/* with correct key → not 401 (auth passed; handler runs with the K8s mock)
+        r = await client.get("/api/sandboxes", headers={"X-API-Key": "test-secret"})
+        assert r.status_code != 401
+
+
+@pytest.mark.asyncio
+async def test_auth_middleware_unset_key(monkeypatch: pytest.MonkeyPatch, provisioner_module) -> None:
+    """When PROVISIONER_API_KEY is unset/empty, all /api/* routes return 401."""
+    monkeypatch.setattr(provisioner_module, "PROVISIONER_API_KEY", "")
+    fake_core_v1 = _RecordingCoreV1(event_loop_thread_id=-1)
+    monkeypatch.setattr(provisioner_module, "core_v1", fake_core_v1)
+
+    transport = httpx.ASGITransport(app=provisioner_module.app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
+        # /health is always open even when key is unset
+        r = await client.get("/health")
+        assert r.status_code == 200
+
+        # /api/* is always 401 when key is unset — even with a header
+        r = await client.get("/api/sandboxes")
+        assert r.status_code == 401
+
+        r = await client.get("/api/sandboxes", headers={"X-API-Key": "anything"})
+        assert r.status_code == 401

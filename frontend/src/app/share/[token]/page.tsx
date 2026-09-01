@@ -6,7 +6,7 @@ import { useEffect, useState } from "react";
 
 import { ToggleGroup, ToggleGroupItem } from "@/components/ui/toggle-group";
 import { CodeEditor } from "@/components/workspace/code-editor";
-import { ArtifactFilePreview } from "@/components/workspace/artifacts/artifact-file-detail";
+import { ArtifactFilePreview } from "@/components/workspace/artifacts/artifact-file-preview";
 import { ThreadContext, type ThreadContextType } from "@/components/workspace/messages/context";
 import { getBackendBaseURL } from "@/core/config";
 import { checkCodeFile } from "@/core/utils/files";

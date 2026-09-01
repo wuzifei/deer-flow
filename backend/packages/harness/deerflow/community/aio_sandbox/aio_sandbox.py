@@ -5,12 +5,15 @@ import shlex
 import threading
 import uuid
 
+import httpx
 from agent_sandbox import Sandbox as AioSandboxClient
 from agent_sandbox.core.api_error import ApiError
 
 from deerflow.config.paths import VIRTUAL_PATH_PREFIX
 from deerflow.sandbox.sandbox import Sandbox, _validate_extra_env
 from deerflow.sandbox.search import GrepMatch, path_matches, should_ignore_path, truncate_line
+
+from .backend import sandbox_http_trust_env
 
 logger = logging.getLogger(__name__)
 
@@ -40,6 +43,11 @@ class AioSandbox(Sandbox):
     from corrupting the container's single persistent session (see #1433).
     """
 
+    #: The legacy exec path reuses one persistent shell session across calls,
+    #: so shell state (exports, cwd, functions) carries from one command into
+    #: the next — recorded bash evidence cannot prove a clean environment.
+    persistent_shell_sessions = True
+
     def __init__(self, id: str, base_url: str, home_dir: str | None = None):
         """Initialize the AIO sandbox.
 
@@ -50,7 +58,15 @@ class AioSandbox(Sandbox):
         """
         super().__init__(id)
         self._base_url = base_url
-        self._client = AioSandboxClient(base_url=base_url, timeout=600)
+        if sandbox_http_trust_env(base_url):
+            self._client = AioSandboxClient(base_url=base_url, timeout=600)
+        else:
+            direct_client = httpx.Client(timeout=600, follow_redirects=True, trust_env=False)
+            self._client = AioSandboxClient(
+                base_url=base_url,
+                timeout=600,
+                httpx_client=direct_client,
+            )
         self._home_dir = home_dir
         self._lock = threading.Lock()
         self._closed = False
@@ -181,6 +197,7 @@ class AioSandbox(Sandbox):
             try:
                 result = self._client.shell.exec_command(command=command, no_change_timeout=self._DEFAULT_NO_CHANGE_TIMEOUT)
                 output = result.data.output if result.data else ""
+                exit_code = getattr(result.data, "exit_code", None) if result.data else None
 
                 if output and _ERROR_OBSERVATION_SIGNATURE in output:
                     logger.warning("ErrorObservation detected in sandbox output, retrying on a fresh session")
@@ -192,6 +209,7 @@ class AioSandbox(Sandbox):
                     try:
                         result = self._client.shell.exec_command(command=command, id=fresh_id, no_change_timeout=self._DEFAULT_NO_CHANGE_TIMEOUT)
                         output = result.data.output if result.data else ""
+                        exit_code = getattr(result.data, "exit_code", None) if result.data else None
                     finally:
                         # Release the one-shot recovery session, best-effort, so
                         # repeated corruption can't accumulate sessions.
@@ -200,6 +218,10 @@ class AioSandbox(Sandbox):
                         except Exception as cleanup_error:
                             logger.warning(f"Failed to release recovery session {fresh_id}: {cleanup_error}")
 
+                if exit_code not in (0, None):
+                    # Mirror LocalSandbox: keep the actual shell status in the
+                    # output text (acceptance-checklist evidence).
+                    output = f"{output}\nExit Code: {exit_code}" if output else f"Command exited with code {exit_code}"
                 return output if output else "(no output)"
             except Exception as e:
                 logger.error(f"Failed to execute command in sandbox: {e}")
@@ -255,9 +277,14 @@ class AioSandbox(Sandbox):
                 data = result.data if result else None
                 stdout = (data.stdout or "") if data else ""
                 stderr = (data.stderr or "") if data else ""
+                exit_code = getattr(data, "exit_code", None) if data else None
                 output = stdout
                 if stderr:
                     output += f"\nStd Error:\n{stderr}" if output else stderr
+                if exit_code not in (0, None):
+                    # Mirror LocalSandbox: keep the actual shell status in the
+                    # output text (acceptance-checklist evidence).
+                    output = f"{output}\nExit Code: {exit_code}" if output else f"Command exited with code {exit_code}"
                 return output if output else "(no output)"
             except ApiError as e:
                 if e.status_code == 404:
@@ -270,7 +297,12 @@ class AioSandbox(Sandbox):
                 logger.error(f"Failed to execute command with injected env in sandbox: {e}")
                 return f"Error: {e}"
 
-    def read_file(self, path: str) -> str:
+    def read_file(
+        self,
+        path: str,
+        start_line: int | None = None,
+        end_line: int | None = None,
+    ) -> str:
         """Read the content of a file in the sandbox.
 
         Args:
@@ -280,7 +312,12 @@ class AioSandbox(Sandbox):
             The content of the file.
         """
         try:
-            result = self._client.file.read_file(file=path)
+            kwargs = {}
+            if start_line is not None:
+                kwargs["start_line"] = max(start_line - 1, 0)
+            if end_line is not None:
+                kwargs["end_line"] = max(end_line, 0)
+            result = self._client.file.read_file(file=path, **kwargs)
             return result.data.content if result.data else ""
         except Exception as e:
             logger.error(f"Failed to read file in sandbox: {e}")
@@ -411,41 +448,45 @@ class AioSandbox(Sandbox):
         # (caught by grep_tool's except re.error handler) rather than a
         # generic remote API error.
         _re.compile(regex_source, 0 if case_sensitive else _re.IGNORECASE)
-        regex = regex_source if case_sensitive else f"(?i){regex_source}"
-
-        if glob is not None:
-            find_result = self._client.file.find_files(path=path, glob=glob)
-            candidate_paths = find_result.data.files if find_result.data and find_result.data.files else []
-        else:
-            list_result = self._client.file.list_path(path=path, recursive=True, show_hidden=False)
-            entries = list_result.data.files if list_result.data and list_result.data.files else []
-            candidate_paths = [entry.path for entry in entries if not entry.is_directory]
+        total_cap = max(max_results * 4, max_results + 50)
+        result = self._client.file.grep_files(
+            path=path,
+            pattern=pattern,
+            case_insensitive=not case_sensitive,
+            fixed_strings=literal,
+            max_results=total_cap,
+            max_file_size="1M",
+            recursive=True,
+        )
+        data = result.data
+        provider_matches = data.matches if data and data.matches else []
+        root = path.rstrip("/") or "/"
+        root_prefix = root if root == "/" else f"{root}/"
 
         matches: list[GrepMatch] = []
-        truncated = False
-
-        for file_path in candidate_paths:
+        truncated = bool(data and data.truncated)
+        for match in provider_matches:
+            file_path = match.file
             if should_ignore_path(file_path):
                 continue
-
-            search_result = self._client.file.search_in_file(file=file_path, regex=regex)
-            data = search_result.data
-            if data is None:
+            if file_path == root:
+                rel_path = file_path.rsplit("/", 1)[-1]
+            elif file_path.startswith(root_prefix):
+                rel_path = file_path[len(root_prefix) :]
+            else:
                 continue
-
-            line_numbers = data.line_numbers or []
-            matched_lines = data.matches or []
-            for line_number, line in zip(line_numbers, matched_lines):
-                matches.append(
-                    GrepMatch(
-                        path=file_path,
-                        line_number=line_number if isinstance(line_number, int) else 0,
-                        line=truncate_line(line),
-                    )
+            if glob is not None and not path_matches(glob, rel_path):
+                continue
+            matches.append(
+                GrepMatch(
+                    path=file_path,
+                    line_number=match.line_number,
+                    line=truncate_line(match.line_content),
                 )
-                if len(matches) >= max_results:
-                    truncated = True
-                    return matches, truncated
+            )
+            if len(matches) >= max_results:
+                truncated = True
+                break
 
         return matches, truncated
 
