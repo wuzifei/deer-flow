@@ -100,6 +100,7 @@ export const enUS: Translations = {
     modified: "Modified",
     deleted: "Deleted",
     openFile: "Open file",
+    previewFile: "Preview file",
     loading: "Loading workspace changes...",
     noChanges: "No workspace changes recorded.",
     diffUnavailable: "Diff unavailable",

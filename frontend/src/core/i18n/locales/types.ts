@@ -83,6 +83,7 @@ export interface Translations {
     modified: string;
     deleted: string;
     openFile: string;
+    previewFile: string;
     loading: string;
     noChanges: string;
     diffUnavailable: string;

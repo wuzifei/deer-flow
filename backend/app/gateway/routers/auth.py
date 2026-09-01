@@ -431,6 +431,8 @@ _SETUP_STATUS_INFLIGHT_GUARD = asyncio.Lock()
 @router.get("/setup-status")
 async def setup_status(request: Request):
     """Check if an admin account exists. Returns needs_setup=True when no admin exists."""
+    client_ip = _get_client_ip(request)
+    now = time.time()
 
     # Return cached result when within TTL —avoids 429 on multi-tab reconnection.
     cached = _SETUP_STATUS_CACHE.get(client_ip)

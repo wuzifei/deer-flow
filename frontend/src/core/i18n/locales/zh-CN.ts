@@ -99,6 +99,7 @@ export const zhCN: Translations = {
     modified: "修改",
     deleted: "删除",
     openFile: "打开文件",
+    previewFile: "预览文件",
     loading: "正在加载工作区变更...",
     noChanges: "没有记录到工作区变更。",
     diffUnavailable: "无法展示 diff",

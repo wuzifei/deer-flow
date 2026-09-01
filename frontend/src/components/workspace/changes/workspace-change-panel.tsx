@@ -2,11 +2,13 @@
 
 import {
   ExternalLinkIcon,
+  EyeIcon,
   FileDiffIcon,
   FileMinusIcon,
   FilePenLineIcon,
   FilePlusIcon,
 } from "lucide-react";
+import { useState } from "react";
 
 import {
   Collapsible,
@@ -14,11 +16,13 @@ import {
   CollapsibleTrigger,
 } from "@/components/ui/collapsible";
 import {
+  Sheet,
   SheetContent,
   SheetDescription,
   SheetHeader,
   SheetTitle,
 } from "@/components/ui/sheet";
+import { ArtifactFileDetail } from "@/components/workspace/artifacts";
 import { resolveArtifactURL } from "@/core/artifacts/utils";
 import { useI18n } from "@/core/i18n/hooks";
 import { useWorkspaceChanges } from "@/core/workspace-changes/hooks";
@@ -62,6 +66,7 @@ export function WorkspaceChangePanel({
   };
   const fileCount = getChangedFileCount(changes.summary);
   const files = sortWorkspaceChanges(changes.files);
+  const [previewPath, setPreviewPath] = useState<string | null>(null);
 
   return (
     <SheetContent className="w-[min(92vw,900px)] gap-0 p-0 sm:max-w-[900px]">
@@ -99,10 +104,35 @@ export function WorkspaceChangePanel({
               key={`${file.status}:${file.path}`}
               file={file}
               threadId={threadId}
+              onPreview={() => setPreviewPath(file.path)}
             />
           ))}
         </div>
       </div>
+
+      <Sheet
+        open={previewPath !== null}
+        onOpenChange={(isOpen) => {
+          if (!isOpen) {
+            setPreviewPath(null);
+          }
+        }}
+      >
+        <SheetContent className="w-[min(92vw,900px)] gap-0 p-0 sm:max-w-[900px] [&>button]:hidden">
+          <SheetHeader className="sr-only">
+            <SheetTitle>{t.workspaceChanges.previewFile}</SheetTitle>
+            <SheetDescription>{previewPath ?? ""}</SheetDescription>
+          </SheetHeader>
+          {previewPath && (
+            <ArtifactFileDetail
+              className="size-full"
+              filepath={previewPath}
+              threadId={threadId}
+              onClose={() => setPreviewPath(null)}
+            />
+          )}
+        </SheetContent>
+      </Sheet>
     </SheetContent>
   );
 }
@@ -110,9 +140,11 @@ export function WorkspaceChangePanel({
 function WorkspaceChangeFile({
   file,
   threadId,
+  onPreview,
 }: {
   file: WorkspaceFileChange;
   threadId: string;
+  onPreview: () => void;
 }) {
   const { t } = useI18n();
   const hasDiff = file.diff.length > 0;
@@ -141,16 +173,31 @@ function WorkspaceChangeFile({
             </div>
           </div>
           {canOpenFile && (
-            <a
-              href={openUrl}
-              target="_blank"
-              rel="noopener noreferrer"
-              className="text-muted-foreground hover:text-foreground rounded-md p-1 transition-colors"
-              title={t.workspaceChanges.openFile}
-              onClick={(event) => event.stopPropagation()}
-            >
-              <ExternalLinkIcon className="size-3.5" />
-            </a>
+            <div className="flex shrink-0 items-center gap-0.5">
+              <a
+                role="button"
+                tabIndex={0}
+                className="text-muted-foreground hover:text-foreground rounded-md p-1 transition-colors"
+                title={t.workspaceChanges.previewFile}
+                onClick={(event) => {
+                  event.stopPropagation();
+                  event.preventDefault();
+                  onPreview();
+                }}
+              >
+                <EyeIcon className="size-3.5" />
+              </a>
+              <a
+                href={openUrl}
+                target="_blank"
+                rel="noopener noreferrer"
+                className="text-muted-foreground hover:text-foreground rounded-md p-1 transition-colors"
+                title={t.workspaceChanges.openFile}
+                onClick={(event) => event.stopPropagation()}
+              >
+                <ExternalLinkIcon className="size-3.5" />
+              </a>
+            </div>
           )}
         </CollapsibleTrigger>
         <CollapsibleContent>

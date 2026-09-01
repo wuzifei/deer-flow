@@ -79,10 +79,12 @@ export function ArtifactFileDetail({
   className,
   filepath: filepathFromProps,
   threadId,
+  onClose,
 }: {
   className?: string;
   filepath: string;
   threadId: string;
+  onClose?: () => void;
 }) {
   const { t } = useI18n();
   const { user } = useAuth();
@@ -386,7 +388,13 @@ export function ArtifactFileDetail({
             <ArtifactAction
               icon={XIcon}
               label={t.common.close}
-              onClick={() => setOpen(false)}
+              onClick={() => {
+                if (onClose) {
+                  onClose();
+                } else {
+                  setOpen(false);
+                }
+              }}
               tooltip={t.common.close}
             />
           </ArtifactActions>
